@@ -46,13 +46,7 @@
 static void ef100_update_name(struct efx_nic *efx)
 {
 	strcpy(efx->name, efx->net_dev->name);
-#ifdef CONFIG_SFC_DEBUGFS
-	mutex_lock(&efx->debugfs_symlink_mutex);
-	if (efx->debug_symlink)
-		efx_fini_debugfs_netdev(efx->net_dev);
-	efx_init_debugfs_netdev(efx->net_dev);
-	mutex_unlock(&efx->debugfs_symlink_mutex);
-#endif
+	efx_update_debugfs_netdev(efx);
 }
 
 static int ef100_alloc_vis(struct efx_nic *efx, unsigned int *allocated_vis)
@@ -702,7 +696,7 @@ static const struct net_device_ops ef100_netdev_ops = {
 #if !defined(EFX_USE_KCOMPAT) || defined(EFX_TC_OFFLOAD)
 	.ndo_setup_tc		= efx_setup_tc,
 #endif
-#if !defined(EFX_USE_KCOMPAT) || defined(EFX_USE_DEVLINK)
+#if defined(EFX_USE_KCOMPAT) && defined(EFX_HAVE_NDO_GET_DEVLINK_PORT)
 #ifdef CONFIG_NET_DEVLINK
 	.ndo_get_devlink_port	= efx_get_devlink_port,
 #endif
@@ -779,6 +773,11 @@ static int ef100_register_netdev(struct efx_nic *efx)
 		goto fail_locked;
 	ef100_update_name(efx);
 
+#if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_SET_NETDEV_DEVLINK_PORT)
+#ifdef CONFIG_NET_DEVLINK
+	SET_NETDEV_DEVLINK_PORT(net_dev, efx->devlink_port);
+#endif
+#endif
 	rc = register_netdevice(net_dev);
 	if (rc)
 		goto fail_locked;
@@ -848,7 +847,7 @@ void ef100_remove_netdev(struct efx_probe_data *probe_data)
 		efx_fini_tc(efx);
 	}
 
-#ifdef CONFIG_SFC_DEBUGFS
+#ifdef CONFIG_DEBUG_FS
 	mutex_lock(&efx->debugfs_symlink_mutex);
 	efx_fini_debugfs_netdev(efx->net_dev);
 	mutex_unlock(&efx->debugfs_symlink_mutex);

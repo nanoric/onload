@@ -24,11 +24,6 @@
 #include <linux/unistd.h> /* for __NR_epoll_pwait */
 #include "onload_internal.h"
 
-/* This is needed for RHEL4 and similar vintage kernels */
-#ifndef __MODULE_PARM_TYPE
-#define __MODULE_PARM_TYPE(name, _type)                 \
-  __MODULE_INFO(parmtype, name##type, #name ":" _type)
-#endif
 
 static int set_max_stacks(const char *val, 
                           const struct kernel_param *kp);
@@ -643,7 +638,7 @@ static int oo_epoll1_mmap(struct oo_epoll1_private* priv,
     return -EINVAL;
   if (vma->vm_flags & VM_WRITE)
     return -EPERM;
-  vma->vm_flags &= ~VM_MAYWRITE;
+  vm_flags_clear(vma, VM_MAYWRITE);
 
   /* Map memory to user */
   if( priv->page == NULL ||
@@ -1153,6 +1148,7 @@ static long oo_epoll_fop_unlocked_ioctl(struct file* filp,
 
     rc = oo_epoll1_spin_on(filp, other_filp, local_arg.timeout_us,
                                              local_arg.sleep_iter_us);
+    fput(other_filp);
 
     if( signal_pending(current) )
       rc = -EINTR;
@@ -1191,6 +1187,7 @@ static long oo_epoll_fop_unlocked_ioctl(struct file* filp,
 #endif
 
     rc = oo_epoll1_block_on(filp, other_filp, local_arg.timeout_us);
+    fput(other_filp);
 
     if( signal_pending(current) )
       rc = -EINTR;

@@ -20,6 +20,7 @@
 #include "nic.h"
 #ifdef CONFIG_SFC_VDPA
 #include "ef100_vdpa.h"
+#include "mcdi_filters.h"
 #endif
 
 
@@ -30,44 +31,6 @@ struct efx_debugfs_bound_param {
 	void *ref;
 	unsigned int index;
 };
-
-
-#ifdef EFX_USE_KCOMPAT
-
-#ifndef EFX_HAVE_DEBUGFS_CREATE_SYMLINK
-
-/* We don't absolutely need the symlinks, and we don't do anything
- * with the returned dentry pointer except compare it to NULL and then
- * later pass it to debugfs_remove().  So make
- * debugfs_create_symlink() return a fake dentry and filter that out
- * in debugfs_remove().
- */
-
-static struct dentry efx_debugfs_dummy_dentry;
-
-static struct dentry *
-efx_debugfs_create_symlink(const char *name, struct dentry *old_dentry,
-			   const char *dest)
-{
-	return &efx_debugfs_dummy_dentry;
-}
-#define debugfs_create_symlink efx_debugfs_create_symlink
-
-static void efx_debugfs_remove(struct dentry *dentry)
-{
-	if (dentry != &efx_debugfs_dummy_dentry)
-		debugfs_remove(dentry);
-}
-#define debugfs_remove efx_debugfs_remove
-
-#endif
-
-#ifdef EFX_HAVE_INODE_U_GENERIC_IP
-#define i_private u.generic_ip
-#endif
-
-#endif /* EFX_USE_KCOMPAT */
-
 
 /* Maximum length for a name component or symlink target */
 #define EFX_DEBUGFS_NAME_LEN 32
@@ -112,54 +75,6 @@ static struct file_operations efx_debugfs_file_ops = {
 	.release = single_release
 };
 
-
-/**
- * efx_fini_debugfs_child - remove a named child of a debugfs directory
- * @dir:		Directory
- * @name:		Name of child
- *
- * This removes the named child from the directory, if it exists.
- */
-void efx_fini_debugfs_child(struct dentry *dir, const char *name)
-{
-	struct qstr child_name = QSTR_INIT(name, strlen(name));
-	struct dentry *child;
-
-	child = d_hash_and_lookup(dir, &child_name);
-	if (!IS_ERR_OR_NULL(child)) {
-		/* If it's a "regular" file, free its parameter binding */
-		if (S_ISREG(child->d_inode->i_mode))
-			kfree(child->d_inode->i_private);
-		debugfs_remove(child);
-		dput(child);
-	}
-}
-
-/*
- * Remove a debugfs directory.
- *
- * This removes the named parameter-files and sym-links from the
- * directory, and the directory itself.  It does not do any recursion
- * to subdirectories.
- */
-static void efx_fini_debugfs_dir(struct dentry *dir,
-				 struct efx_debugfs_parameter *params,
-				 const char *const *symlink_names)
-{
-	if (!dir)
-		return;
-
-	while (params->name) {
-		efx_fini_debugfs_child(dir, params->name);
-		params++;
-	}
-	while (symlink_names && *symlink_names) {
-		efx_fini_debugfs_child(dir, *symlink_names);
-		symlink_names++;
-	}
-	debugfs_remove(dir);
-}
-
 /* Functions for printing various types of parameter. */
 
 int efx_debugfs_read_ushort(struct seq_file *file, void *data)
@@ -189,15 +104,6 @@ int efx_debugfs_read_ulong(struct seq_file *file, void *data)
 int efx_debugfs_read_atomic(struct seq_file *file, void *data)
 {
 	unsigned int value = atomic_read((atomic_t *) data);
-
-	seq_printf(file, "%#x\n", value);
-	return 0;
-}
-
-int efx_debugfs_read_dword(struct seq_file *file, void *data)
-{
-	unsigned int value = EFX_DWORD_FIELD(*(efx_dword_t *) data,
-					     EFX_DWORD_0);
 
 	seq_printf(file, "%#x\n", value);
 	return 0;
@@ -302,7 +208,7 @@ int efx_debugfs_read_string(struct seq_file *file, void *data)
  */
 static int
 efx_init_debugfs_files(struct dentry *parent,
-		       struct efx_debugfs_parameter *params, u64 ignore,
+		       const struct efx_debugfs_parameter *params, u64 ignore,
 		       void *(*get_struct)(void *, unsigned int),
 		       void *ref, unsigned int struct_index)
 {
@@ -338,7 +244,7 @@ err:
 		if ((1ULL << pos) & ignore)
 			continue;
 
-		efx_fini_debugfs_child(parent, params[pos].name);
+		debugfs_lookup_and_remove(params[pos].name, parent);
 	}
 	return -ENOMEM;
 }
@@ -414,8 +320,17 @@ void efx_fini_debugfs_netdev(struct net_device *net_dev)
 	efx->debug_symlink = NULL;
 }
 
+void efx_update_debugfs_netdev(struct efx_nic *efx)
+{
+	mutex_lock(&efx->debugfs_symlink_mutex);
+	if (efx->debug_symlink)
+		efx_fini_debugfs_netdev(efx->net_dev);
+	efx_init_debugfs_netdev(efx->net_dev);
+	mutex_unlock(&efx->debugfs_symlink_mutex);
+}
+
 /* Per-port parameters */
-static struct efx_debugfs_parameter efx_debugfs_port_parameters[] = {
+static const struct efx_debugfs_parameter efx_debugfs_port_parameters[] = {
 	EFX_NAMED_PARAMETER(enabled, struct efx_nic, port_enabled,
 			    bool, efx_debugfs_read_bool),
 #if defined(EFX_USE_KCOMPAT) && !defined(NETIF_F_LRO)
@@ -460,7 +375,7 @@ static void *efx_debugfs_get_same(void *ref, unsigned int index)
  */
 int efx_extend_debugfs_port(struct efx_nic *efx,
 			    void *structure, u64 ignore,
-			    struct efx_debugfs_parameter *params)
+			    const struct efx_debugfs_parameter *params)
 {
 	if (WARN_ON(!efx->debug_port_dir))
 		return -ENOENT;
@@ -478,14 +393,14 @@ int efx_extend_debugfs_port(struct efx_nic *efx,
  * for @efx using efx_extend_debugfs_port().
  */
 void efx_trim_debugfs_port(struct efx_nic *efx,
-			   struct efx_debugfs_parameter *params)
+			   const struct efx_debugfs_parameter *params)
 {
 	struct dentry *dir = efx->debug_port_dir;
 
 	if (dir) {
-		struct efx_debugfs_parameter *field;
+		const struct efx_debugfs_parameter *field;
 		for (field = params; field->name; field++)
-			efx_fini_debugfs_child(dir, field->name);
+			debugfs_lookup_and_remove(field->name, dir);
 	}
 }
 
@@ -500,14 +415,22 @@ static int efx_debugfs_read_vdpa_mac(struct seq_file *file, void *data)
         return 0;
 }
 
+static int ef100_vdpa_debugfs_read_filter_list(struct seq_file *file, void *data)
+{
+	struct ef100_vdpa_nic *vdpa_nic = data;
+
+	return efx_debugfs_read_filter_list(file, vdpa_nic->efx);
+}
+
 /* Per vdpa parameters */
-static struct efx_debugfs_parameter efx_debugfs_vdpa_parameters[] = {
+static const struct efx_debugfs_parameter efx_debugfs_vdpa_parameters[] = {
 	EFX_UINT_PARAMETER(struct ef100_vdpa_nic, vdpa_state),
 	EFX_UINT_PARAMETER(struct ef100_vdpa_nic, pf_index),
 	EFX_UINT_PARAMETER(struct ef100_vdpa_nic, vf_index),
 	EFX_X64_PARAMETER(struct ef100_vdpa_nic, features),
 	EFX_UINT_PARAMETER(struct ef100_vdpa_nic, max_queue_pairs),
 	_EFX_RAW_PARAMETER(mac_address, efx_debugfs_read_vdpa_mac),
+	_EFX_RAW_PARAMETER(filters, ef100_vdpa_debugfs_read_filter_list),
 	{NULL},
 };
 
@@ -564,13 +487,13 @@ err_mem:
  */
 void efx_fini_debugfs_vdpa(struct ef100_vdpa_nic *vdpa)
 {
-	efx_fini_debugfs_dir(vdpa->debug_dir,
-			     efx_debugfs_vdpa_parameters, NULL);
+	debugfs_remove_recursive(vdpa->debug_dir);
 	vdpa->debug_dir = NULL;
 }
 
 /* Per vring parameters */
-static struct efx_debugfs_parameter efx_debugfs_vdpa_vring_parameters[] = {
+static const
+struct efx_debugfs_parameter efx_debugfs_vdpa_vring_parameters[] = {
 	EFX_UINT_PARAMETER(struct ef100_vdpa_vring_info, size),
 	EFX_USHORT_PARAMETER(struct ef100_vdpa_vring_info, vring_state),
 	EFX_UINT_PARAMETER(struct ef100_vdpa_vring_info, last_avail_idx),
@@ -639,14 +562,13 @@ err_mem:
  */
 void efx_fini_debugfs_vdpa_vring(struct ef100_vdpa_vring_info *vdpa_vring)
 {
-	efx_fini_debugfs_dir(vdpa_vring->debug_dir,
-			     efx_debugfs_vdpa_vring_parameters, NULL);
+	debugfs_remove_recursive(vdpa_vring->debug_dir);
 	vdpa_vring->debug_dir = NULL;
 }
 #endif
 
 /* Per-TX-queue parameters */
-static struct efx_debugfs_parameter efx_debugfs_tx_queue_parameters[] = {
+static const struct efx_debugfs_parameter efx_debugfs_tx_queue_parameters[] = {
 	EFX_UINT_PARAMETER(struct efx_tx_queue, queue),
 	EFX_UINT_PARAMETER(struct efx_tx_queue, insert_count),
 	EFX_UINT_PARAMETER(struct efx_tx_queue, write_count),
@@ -743,17 +665,12 @@ static int efx_init_debugfs_tx_queue(struct efx_tx_queue *tx_queue)
  */
 static void efx_fini_debugfs_tx_queue(struct efx_tx_queue *tx_queue)
 {
-	static const char *const symlink_names[] = {
-		"channel", "port", NULL
-	};
-
-	efx_fini_debugfs_dir(tx_queue->debug_dir,
-			     efx_debugfs_tx_queue_parameters, symlink_names);
+	debugfs_remove_recursive(tx_queue->debug_dir);
 	tx_queue->debug_dir = NULL;
 }
 
 /* Per-RX-queue parameters */
-static struct efx_debugfs_parameter efx_debugfs_rx_queue_parameters[] = {
+static const struct efx_debugfs_parameter efx_debugfs_rx_queue_parameters[] = {
 	EFX_UINT_PARAMETER(struct efx_rx_queue, added_count),
 	EFX_UINT_PARAMETER(struct efx_rx_queue, removed_count),
 	EFX_UINT_PARAMETER(struct efx_rx_queue, max_fill),
@@ -865,17 +782,12 @@ static int efx_init_debugfs_rx_queue(struct efx_rx_queue *rx_queue)
  */
 static void efx_fini_debugfs_rx_queue(struct efx_rx_queue *rx_queue)
 {
-	const char *const symlink_names[] = {
-		"channel", NULL
-	};
-
-	efx_fini_debugfs_dir(rx_queue->debug_dir,
-			     efx_debugfs_rx_queue_parameters, symlink_names);
+	debugfs_remove_recursive(rx_queue->debug_dir);
 	rx_queue->debug_dir = NULL;
 }
 
 /* Per-channel parameters */
-static struct efx_debugfs_parameter efx_debugfs_channel_parameters[] = {
+static const struct efx_debugfs_parameter efx_debugfs_channel_parameters[] = {
 	EFX_BOOL_PARAMETER(struct efx_channel, enabled),
 	EFX_INT_PARAMETER(struct efx_channel, irq),
 	EFX_UINT_PARAMETER(struct efx_channel, irq_moderation_us),
@@ -947,86 +859,23 @@ static int efx_init_debugfs_channel(struct efx_channel *channel)
  */
 static void efx_fini_debugfs_channel(struct efx_channel *channel)
 {
-	efx_fini_debugfs_dir(channel->debug_dir,
-			     efx_debugfs_channel_parameters, NULL);
+	debugfs_remove_recursive(channel->debug_dir);
 	channel->debug_dir = NULL;
 }
 
-static int efx_nic_debugfs_read_desc(struct seq_file *file, void *data)
-{
-	struct efx_nic *efx = data;
-	const char *rev_name;
-	uint8_t revision;
-
-	switch (efx_nic_rev(efx)) {
-	case EFX_REV_HUNT_A0:
-		rev_name = "Huntington";
-		break;
-	case EFX_REV_EF100:
-		rev_name = "Riverhead";
-		break;
-	default:
-		WARN_ON(1);
-		rev_name = "???";
-		break;
-	}
-
-	pci_read_config_byte(efx->pci_dev, PCI_REVISION_ID, &revision);
-	seq_printf(file, "%s %s (rev A%d) board\n", rev_name, efx->phy_name,
-		   revision);
-	return 0;
-}
-
-static int efx_nic_debugfs_read_name(struct seq_file *file, void *data)
-{
-	struct efx_nic *efx = data;
-
-	seq_printf(file, "%s\n", efx->name);
-	return 0;
-}
-
-static int efx_nic_debugfs_read_rx_channels(struct seq_file *file, void *data)
-{
-	struct efx_nic *efx = data;
-
-	seq_printf(file, "%d\n", efx_rx_channels(efx));
-	return 0;
-}
-
-static int efx_nic_debugfs_read_tx_channels(struct seq_file *file, void *data)
-{
-	struct efx_nic *efx = data;
-
-	seq_printf(file, "%d\n", efx_tx_channels(efx));
-	return 0;
-}
-
 /* Per-NIC parameters */
-static struct efx_debugfs_parameter efx_debugfs_nic_parameters[] = {
-	/* Runbench requires we call this n_rx_queues and use decimal format */
-	{.name = "n_rx_queues",
-	 .offset = 0,
-	 .reader = efx_nic_debugfs_read_rx_channels},
-	{.name = "n_tx_channels",
-	 .offset = 0,
-	 .reader = efx_nic_debugfs_read_tx_channels},
-	EFX_UINT_PARAMETER(struct efx_nic, n_combined_channels),
+static const struct efx_debugfs_parameter efx_debugfs_nic_parameters[] = {
 	EFX_UINT_PARAMETER(struct efx_nic, rx_dma_len),
 	EFX_UINT_PARAMETER(struct efx_nic, rx_buffer_order),
 	EFX_UINT_PARAMETER(struct efx_nic, rx_buffer_truesize),
 	EFX_INT_MODE_PARAMETER(struct efx_nic, interrupt_mode),
 	EFX_NIC_STATE_PARAMETER(struct efx_nic, state),
-	{.name = "hardware_desc",
-	 .offset = 0,
-	 .reader = efx_nic_debugfs_read_desc},
-	{.name = "name",
-	 .offset = 0,
-	 .reader = efx_nic_debugfs_read_name},
 	{NULL},
 };
 
 /* Per-NIC error counts */
-static struct efx_debugfs_parameter efx_debugfs_nic_error_parameters[] = {
+static const
+struct efx_debugfs_parameter efx_debugfs_nic_error_parameters[] = {
 	EFX_ATOMIC_PARAMETER(struct efx_nic_errors, missing_event),
 	EFX_ATOMIC_PARAMETER(struct efx_nic_errors, rx_reset),
 	EFX_ATOMIC_PARAMETER(struct efx_nic_errors, rx_desc_fetch),
@@ -1180,19 +1029,16 @@ int efx_init_debugfs_nic(struct efx_nic *efx)
  */
 void efx_fini_debugfs_nic(struct efx_nic *efx)
 {
-	efx_fini_debugfs_dir(efx->debug_port_dir,
-			     efx_debugfs_port_parameters, NULL);
+	debugfs_remove_recursive(efx->debug_port_dir);
 	efx->debug_port_dir = NULL;
-	efx_fini_debugfs_dir(efx->errors.debug_dir,
-			     efx_debugfs_nic_error_parameters, NULL);
+	debugfs_remove_recursive(efx->errors.debug_dir);
 	efx->errors.debug_dir = NULL;
-	efx_fini_debugfs_dir(efx->debug_dir, efx_debugfs_nic_parameters, NULL);
+	debugfs_remove_recursive(efx->debug_dir);
 	efx->debug_dir = NULL;
 }
 
 /**
  * efx_init_debugfs - create debugfs directories for sfc driver
- * @module: Name of the kernel module.
  *
  * Create debugfs directories "sfc" and "sfc/cards".  This must be
  * called before any of the other functions that create debugfs
@@ -1201,19 +1047,20 @@ void efx_fini_debugfs_nic(struct efx_nic *efx)
  *
  * Return: a negative error code or 0 on success.
  */
-int efx_init_debugfs(const char *module)
+int efx_init_debugfs(void)
 {
 	int rc;
 
 	/* Create top-level directory */
-	efx_debug_root = debugfs_create_dir(module, NULL);
+	efx_debug_root = debugfs_create_dir(KBUILD_MODNAME, NULL);
 	if (!efx_debug_root) {
-		printk(KERN_ERR "debugfs_create_dir %s failed.\n", module);
+		pr_err("debugfs_create_dir %s failed.\n", KBUILD_MODNAME);
 		rc = -ENOMEM;
 		goto err;
 	} else if (IS_ERR(efx_debug_root)) {
 		rc = PTR_ERR(efx_debug_root);
-		printk(KERN_ERR "debugfs_create_dir %s failed, rc=%d.\n", module, rc);
+		pr_err("debugfs_create_dir %s failed, rc=%d.\n",
+		       KBUILD_MODNAME, rc);
 		goto err;
 	}
 
@@ -1244,9 +1091,8 @@ int efx_init_debugfs(const char *module)
  */
 void efx_fini_debugfs(void)
 {
-	debugfs_remove(efx_debug_cards);
+	debugfs_remove_recursive(efx_debug_root);
 	efx_debug_cards = NULL;
-	debugfs_remove(efx_debug_root);
 	efx_debug_root = NULL;
 }
 

@@ -72,6 +72,8 @@ struct vi_attr {
 	uint8_t             vi_set_instance;
 	int8_t              packed_stream;
 	int32_t             ps_buffer_size;
+	bool                want_rxq;
+	bool                want_txq;
 };
 
 CI_BUILD_ASSERT(sizeof(struct vi_attr) <= sizeof(struct efrm_vi_attr));
@@ -464,11 +466,16 @@ int efrm_vi_rm_alloc_instance(struct efrm_pd *pd,
 {
 	struct efrm_nic *efrm_nic;
 	struct efhw_nic *efhw_nic;
-	int channel;
+	struct efrm_alloc_vi_constraints avc = {
+		.channel = vi_attr->channel,
+		.min_vis_in_set = 1,
+		.has_rss_context = 0,
+		.want_txq = vi_attr->want_txq,
+	};
 
 	efhw_nic = efrm_client_get_nic(efrm_pd_to_resource(pd)->rs_client);
+	avc.efhw_nic = efhw_nic;
 	efrm_nic = efrm_nic(efhw_nic);
-	channel = vi_attr->channel;
 	if (vi_attr->interrupt_core >= 0) {
 		struct net_device *dev = efhw_nic_get_net_dev(&efrm_nic->efhw_nic);
 		if (!dev) {
@@ -477,14 +484,14 @@ int efrm_vi_rm_alloc_instance(struct efrm_pd *pd,
 				         __FUNCTION__);
 				return -ENETDOWN;
 			}
-			channel = -1;
+			avc.channel = -1;
 		}
 		else {
 			int ifindex = dev->ifindex;
-			channel = efrm_affinity_cpu_to_channel_dev(linux_efhw_nic(efhw_nic),
+			avc.channel = efrm_affinity_cpu_to_channel_dev(linux_efhw_nic(efhw_nic),
 			                                          vi_attr->interrupt_core);
 			dev_put(dev);
-			if (channel < 0 && print_resource_warnings) {
+			if (avc.channel < 0 && print_resource_warnings) {
 				EFRM_ERR("%s: ERROR: could not map core_id=%d using "
 					"ifindex=%d", __FUNCTION__,
 					(int) vi_attr->interrupt_core, ifindex);
@@ -494,14 +501,13 @@ int efrm_vi_rm_alloc_instance(struct efrm_pd *pd,
 			}
 		}
 	}
-	virs->net_drv_wakeup_channel = channel;
+	virs->net_drv_wakeup_channel = avc.channel;
 
 	if (vi_attr->vi_set != NULL)
 		return efrm_vi_set_alloc_instance(virs, vi_attr->vi_set,
 						  vi_attr->vi_set_instance);
 
-	return efrm_vi_allocator_alloc_set(efrm_nic, 1, 0,
-					   channel, &virs->allocation);
+	return efrm_vi_allocator_alloc_set(efrm_nic, &avc, &virs->allocation);
 }
 
 
@@ -861,10 +867,10 @@ efrm_vi_rm_init_dmaq(struct efrm_vi *virs, enum efhw_q_type queue_type,
 		q_params.rx.ps_buf_size = virs->ps_buf_size;
 		rc = efhw_nic_dmaq_rx_q_init(nic,
 			efrm_pd_get_nic_client_id(virs->pd), &q_params);
-                if( rc >= 0 ) {
-                  virs->rx_prefix_len = rc;
-                  rc = 0;
-                }
+		if( rc >= 0 ) {
+			virs->rx_prefix_len = rc;
+			rc = 0;
+		}
 		break;
 	case EFHW_EVQ:
 		qid = instance;
@@ -1243,8 +1249,7 @@ efrm_vi_q_alloc(struct efrm_vi *virs, enum efhw_q_type q_type,
 	if (nic->devtype.arch != EFHW_ARCH_AF_XDP) {
 		rc = efhw_iopages_alloc(nic, &q->host_pages,
 					qsize.q_len_page_order,
-		                        efhw_nic_phys_contig_queue(nic, q_type)
-,
+					efhw_nic_phys_contig_queue(nic, q_type),
 					iova_base);
 		if (rc < 0) {
 			EFRM_ERR("%s: Failed to allocate %s DMA buffer",
@@ -1301,7 +1306,7 @@ efrm_vi_resource_alloc(struct efrm_client *client,
 {
 	struct efrm_vi_attr attr;
 	struct efrm_vi *virs;
-        unsigned ctpio_mmap_bytes = 0;
+	unsigned ctpio_mmap_bytes = 0;
 	int rc;
 	size_t io_size;
 	resource_size_t io_addr;
@@ -1344,8 +1349,8 @@ efrm_vi_resource_alloc(struct efrm_client *client,
 		if (evq_capacity < 0)
 			evq_capacity = rxq_capacity + txq_capacity;
 
-        /* TODO AF_XDP: allocation order must match the order that ef_vi
-         * expects the queues to be mapped into user memory. */
+		/* TODO AF_XDP: allocation order must match the order that
+		 * ef_vi expects the queues to be mapped into user memory. */
 		if ((rc = efrm_vi_q_alloc(virs, EFHW_EVQ, evq_capacity,
 					0, vi_flags, NULL)) < 0)
 			goto fail_q_alloc;
@@ -1443,6 +1448,8 @@ int __efrm_vi_attr_init(struct efrm_client *client_obsolete,
 	a->channel = -1;
 	a->want_interrupt = false;
 	a->packed_stream = 0;
+	a->want_rxq = true;
+	a->want_txq = true;
 	return 0;
 }
 EXPORT_SYMBOL(__efrm_vi_attr_init);
@@ -1518,6 +1525,16 @@ void efrm_vi_attr_set_want_interrupt(struct efrm_vi_attr *attr)
 EXPORT_SYMBOL(efrm_vi_attr_set_want_interrupt);
 
 
+void efrm_vi_attr_set_queue_types(struct efrm_vi_attr *attr, bool want_rxq,
+                                  bool want_txq)
+{
+	struct vi_attr *a = VI_ATTR_FROM_O_ATTR(attr);
+	a->want_rxq = want_rxq;
+	a->want_txq = want_txq;
+}
+EXPORT_SYMBOL(efrm_vi_attr_set_queue_types);
+
+
 static size_t efrm_vi_get_efct_shm_bytes_nrxq(struct efrm_vi *vi,
                                               size_t n_shm_rxqs)
 {
@@ -1547,6 +1564,7 @@ int  efrm_vi_alloc(struct efrm_client *client,
 	struct efrm_pd *pd;
 	uint32_t nic_client_id;
 	size_t n_shm_rxqs;
+	struct efrm_client *set_client;
 
 	if (o_attr == NULL) {
 		efrm_vi_attr_init(&s_attr);
@@ -1557,8 +1575,16 @@ int  efrm_vi_alloc(struct efrm_client *client,
 	pd = NULL;
 	if (attr->pd != NULL)
 		pd = attr->pd;
-	if (attr->vi_set != NULL)
-		pd = attr->vi_set->pd;
+	if (attr->vi_set != NULL) {
+		EFRM_ASSERT(attr->vi_set->pd);
+		set_client = client ?
+			client :
+			efrm_pd_to_resource(attr->vi_set->pd)->rs_client;
+
+		EFRM_ASSERT(set_client);
+		if (set_client->nic->flags & NIC_FLAG_SHARED_PD)
+			pd = attr->vi_set->pd;
+	}
 	if (pd == NULL) {
 		/* Legacy compatibility.  Create a [pd] from [client]. */
 		if (client == NULL) {
@@ -1617,7 +1643,7 @@ int  efrm_vi_alloc(struct efrm_client *client,
 		}
 		goto fail_alloc_id;
 	}
-       	EFRM_ASSERT(virs->allocation.instance >= 0);
+	EFRM_ASSERT(virs->allocation.instance >= 0);
 
 	nic_client_id = efrm_pd_get_nic_client_id(pd);
 	if (nic_client_id != EFRM_NIC_CLIENT_ID_NONE) {
@@ -1929,8 +1955,8 @@ int efrm_vi_tx_alt_alloc(struct efrm_vi *virs, int num_alt, int num_32b_words)
 	struct efhw_nic *nic = virs->rs.rs_client->nic;
 	int rc;
 
-        if ((num_alt <= 0) || (num_32b_words <= 0))
-                return -EINVAL;
+	if ((num_alt <= 0) || (num_32b_words <= 0))
+		return -EINVAL;
 
 	if (virs->tx_alt_num > 0)
 		return -EALREADY;
@@ -1955,7 +1981,7 @@ int efrm_vi_tx_alt_free(struct efrm_vi *virs)
 	rc = nic->efhw_func->tx_alt_free(nic, virs->tx_alt_num,
 					 virs->tx_alt_cp, virs->tx_alt_ids);
 	if (rc == 0)
-                virs->tx_alt_num = 0;
+		virs->tx_alt_num = 0;
 	return rc;
 }
 EXPORT_SYMBOL(efrm_vi_tx_alt_free);

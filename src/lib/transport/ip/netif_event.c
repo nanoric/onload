@@ -529,12 +529,16 @@ static unsigned convert_discard_flags_efct_ef10(unsigned flags)
     return EF_EVENT_RX_DISCARD_CSUM_BAD;
   if( flags & EF_VI_DISCARD_RX_L3_CSUM_ERR )
     return EF_EVENT_RX_DISCARD_CSUM_BAD;
-  if( flags & EF_VI_DISCARD_RX_TOBE_DISC )
-    return EF_EVENT_RX_DISCARD_OTHER;
   if( flags & EF_VI_DISCARD_RX_INNER_L4_CSUM_ERR )
     return EF_EVENT_RX_DISCARD_INNER_CSUM_BAD;
   if( flags & EF_VI_DISCARD_RX_INNER_L3_CSUM_ERR )
     return EF_EVENT_RX_DISCARD_INNER_CSUM_BAD;
+  if( flags & EF_VI_DISCARD_RX_L2_CLASS_OTHER )
+    return EF_EVENT_RX_DISCARD_OTHER;
+  if( flags & EF_VI_DISCARD_RX_L3_CLASS_OTHER )
+    return EF_EVENT_RX_DISCARD_OTHER;
+  if( flags & EF_VI_DISCARD_RX_L4_CLASS_OTHER )
+    return EF_EVENT_RX_DISCARD_OTHER;
   return 0;
 }
 
@@ -1181,10 +1185,17 @@ static void discard_rx_multi_pkts(ci_netif* ni, struct ci_netif_poll_state* ps,
     s->rx_pkt = NULL;
 
   /* Fragmented packets cannot be processed by handle_rx_csum_bad().
-   * See also comment in __handle_rx_discard(). */
-  if( (discard_flags & (EF_VI_DISCARD_RX_L3_CSUM_ERR |
-                        EF_VI_DISCARD_RX_L4_CSUM_ERR)) &&
-      !is_frag )
+   * See also comment in __handle_rx_discard().
+   * For builds supporting IPv6 we handle L3_CLASS_OTHER traffic here, as
+   * X3 does not recognise IPv6, so we always need to software checksum
+   * traffic, which we'll receive through a discard event. In non-IPv6 builds
+   * L3_CLASS_OTHER can always be ditched. */
+  if( (discard_flags & (EF_VI_DISCARD_RX_L3_CSUM_ERR
+                        | EF_VI_DISCARD_RX_L4_CSUM_ERR
+#if CI_CFG_IPV6
+                        | EF_VI_DISCARD_RX_L3_CLASS_OTHER
+#endif
+                       )) && !is_frag )
     handled = handle_rx_csum_bad(ni, ps, pkt, frame_len);
 
   if( discard_flags & EF_VI_DISCARD_RX_ETH_LEN_ERR )
@@ -1194,6 +1205,8 @@ static void discard_rx_multi_pkts(ci_netif* ni, struct ci_netif_poll_state* ps,
   else if( discard_flags & (EF_VI_DISCARD_RX_L3_CSUM_ERR |
                             EF_VI_DISCARD_RX_L4_CSUM_ERR) )
     CITP_STATS_NETIF_INC(ni, rx_discard_csum_bad);
+  else
+    CITP_STATS_NETIF_INC(ni, rx_discard_other);
 
   if( !handled ) {
     if( oo_tcpdump_check(ni, pkt, pkt->intf_i) ) {
@@ -1202,6 +1215,16 @@ static void discard_rx_multi_pkts(ci_netif* ni, struct ci_netif_poll_state* ps,
     }
 
     ci_netif_pkt_release_rx_1ref(ni, pkt);
+  }
+  else {
+    /* If we've ended up handling the packet we'll double count it in the
+     * stats, with both the discard type and as an rx_ev. This keeps things
+     * simple for testing as it allows us to recognise traffic has been
+     * received through an accelerated path. The additional stat,
+     * rx_sw_csum_pass, allows us to see where this double counting has
+     * occurred. */
+    CITP_STATS_NETIF_INC(ni, rx_evs);
+    CITP_STATS_NETIF_INC(ni, rx_sw_csum_pass);
   }
 }
 
@@ -2135,10 +2158,10 @@ int ci_netif_poll_intf_future(ci_netif* ni, int intf_i, ci_uint64 start_frc)
   ps.tx_pkt_free_list_n = 0;
 
   /* We expect the completion event within a microsecond or so. The timeout
-   * of 100us is to avoid wedging the stack in the case of hardware
+   * of 10us is to avoid wedging the stack in the case of hardware
    * failure/removal or a bug which prevents us getting the event.
    */
-  max_spin = IPTIMER_STATE(ni)->khz / 10000;
+  max_spin = IPTIMER_STATE(ni)->khz / 100;
   ci_prefetch(pkt->dma_start + CI_CACHE_LINE_SIZE);
   while( (rc = future_poll(evq, ev, EF_VI_EVENT_POLL_MIN_EVS)) == 0 ) {
     ci_frc64(&now_frc);

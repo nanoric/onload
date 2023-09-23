@@ -131,6 +131,8 @@ int efhw_nondl_device_type_init(struct efhw_device_type *dt)
 {
 	*dt = (struct efhw_device_type) {
 		.arch = EFHW_ARCH_AF_XDP,
+		.variant = 'X',
+		.revision = 0,
 	};
 	return 0;
 }
@@ -257,8 +259,11 @@ void efhw_nic_init(struct efhw_nic *nic, unsigned flags,
 			8192;
 		/* The TXQ is SW only, but reflects a limited HW resource */
 		nic->q_sizes[EFHW_TXQ] = 512;
-		/* RXQ is virtual/software-only, so we have no restrictions */
-		nic->q_sizes[EFHW_RXQ] = ~0u;
+		/* RXQ is virtual/software-only, but some restrictions
+		 * Limited by CI_EFCT_MAX_SUPERBUFS and XNET-249 to 131,072
+		 * Also EF_VI code currently still limited to powers of 2 */ 
+		nic->q_sizes[EFHW_RXQ] = 512 | 1024 | 2048 | 4096 | 8192 |
+		  16384 | 32768 | 65536 | 131072;
 		nic->efhw_func = &efct_char_functional_units;
 		break;
 #endif

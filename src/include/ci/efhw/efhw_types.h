@@ -56,6 +56,7 @@
 
 struct efhw_nic;
 struct efhw_ev_handler;
+struct efab_nic_design_parameters;
 
 typedef uint32_t efhw_btb_handle;
 
@@ -149,9 +150,27 @@ struct efhw_dmaq_params {
 	};
 };
 
+struct efhw_vi_constraints {
+	int channel;
+	int min_vis_in_set;
+	int has_rss_context;
+	bool want_txq;
+};
+
+struct efhw_filter_info {
+	int rxq;
+	int hw_id;
+	int flags;
+};
+
 /**********************************************************************
  * Portable HW interface. ***************************************
  **********************************************************************/
+
+/* note mode default and src are mutually exclusive */
+#define EFHW_RSS_MODE_DEFAULT 0x1 /* standard non-tproxy mode */
+#define EFHW_RSS_MODE_SRC     0x2 /* semi transparent proxy passive side */
+#define EFHW_RSS_MODE_DST     0x4 /* transparent proxy active side */
 
 /* At the moment we define our filters in terms of an efx_filter_spec. Although
  * this is really the internal format for a subset of supported NIC types,
@@ -161,9 +180,27 @@ struct efhw_dmaq_params {
 struct efx_filter_spec;
 
 #define EFHW_FILTER_F_REPLACE  0x0001
+/* The below three flags are particularly relevant on X3.
+ *
+ * The PREF rxq indicates to the driver that it would prefer
+ * for packets to be steered to a given rxq if available.
+ *
+ * The ANY rxq leaves queue selection to the driver to pick
+ * the nearest available and free hardware queue.
+ *
+ * The exclusivity flag is used for exclusivity purposes.
+ * (see EF_FILTER_FLAG_EXCLUSIVE_RXQ)
+ *
+ * The absense of a specific flag, with a field defined for rxq_no
+ * indicates to the driver that a given hardware queue must be used.
+ */
 #define EFHW_FILTER_F_PREF_RXQ 0x0002
 #define EFHW_FILTER_F_ANY_RXQ  0x0004
 #define EFHW_FILTER_F_EXCL_RXQ 0x0008
+
+#define EFHW_PD_NON_EXC_TOKEN 0xFFFFFFFF
+
+#define EFHW_FILTER_F_IS_EXCL 0x0004
 
 /*--------------------------------------------------------------------
  *
@@ -207,6 +244,9 @@ struct efhw_func_ops {
 	/*! Handle an event from hardware, e.g. delivered via driverlink */
 	int (*handle_event) (struct efhw_nic *nic, efhw_event_t *ev,
 			     int budget);
+
+	bool (*accept_vi_constraints) (struct efhw_nic *nic, int low,
+				       unsigned order, void* arg);
 
   /*-------------- DMA support  ------------ */
 
@@ -331,24 +371,26 @@ struct efhw_func_ops {
   /*-------------- filtering --------------------- */
 	/* Allocate a new RSS context */
 	int (*rss_alloc)(struct efhw_nic *nic, const u32 *indir,const u8 *key,
-			 u32 nic_rss_flags, int num_qs, u32 *rss_context_out);
+			 u32 efhw_rss_mode, int num_qs, u32 *rss_context_out);
 	/* Update an existing RSS context */
 	int (*rss_update)(struct efhw_nic *nic, const u32 *indir,
-			  const u8 *key, u32 nic_rss_flags, u32 rss_context);
+			  const u8 *key, u32 efhw_rss_mode, u32 rss_context);
 	/* Free an existing RSS context */
 	int (*rss_free)(struct efhw_nic *nic, u32 rss_context);
-	/* Get the default RSS flags */
-	int (*rss_flags)(struct efhw_nic *nic, u32 *flags_out);
 
 	/* Insert a filter */
 	int (*filter_insert)(struct efhw_nic *nic,
 			     struct efx_filter_spec *spec, int *rxq,
-			     const struct cpumask *mask, unsigned flags);
+				 unsigned exclusive_rxq_token, const struct cpumask *mask,
+				 unsigned flags);
 	/* Remove a filter */
 	void (*filter_remove)(struct efhw_nic *nic, int filter_id);
 	/* Redirect an existing filter */
 	int (*filter_redirect)(struct efhw_nic *nic, int filter_id,
 			       struct efx_filter_spec *spec);
+	/* Query info about an existing filter */
+	int (*filter_query)(struct efhw_nic *nic, int filter_id,
+	                    struct efhw_filter_info *info);
 
 	/* Set multicast blocking behaviour */
 	int (*multicast_block)(struct efhw_nic *nic, bool block);
@@ -412,6 +454,16 @@ struct efhw_func_ops {
 	 */
 	int (*ctpio_addr)(struct efhw_nic* nic, int instance,
 			  resource_size_t* addr);
+
+  /*-------------- design parameters ------------------------ */
+
+	/*! Obtain the design parameters for the NIC. Any parameters that are
+	 * not known to the requester won't be filled in, but might be checked
+	 * for compatibility with the hardware spec that the requester is
+	 * assumed to be using.
+	 * Returns 0 on success, a negative error otherwise. */
+	int (*design_parameters)(struct efhw_nic* nic,
+	                         struct efab_nic_design_parameters* dp);
 
 	/*! Maximum permitted number of rxqs carrying shared packets. Shared
 	 * queues are attached-to by multiple clients and they're read-only to
@@ -519,6 +571,16 @@ struct efhw_nic {
 		unsigned base;
 		unsigned range;
 	} vi_irq_ranges[NIC_IRQ_MAX_RANGES];
+	unsigned rss_channel_count;
+
+	/* Size of the RSS indirection table.
+	 * Needed to support different NIC vendors in AF_XDP mode
+	 */
+	unsigned rss_indir_size;
+	/* Size of the RSS hash key.
+	 * Needed to support different NIC vendors in AF_XDP mode
+	 */
+	unsigned rss_key_size;
 
 	/* Size of PIO buffer */
 	unsigned pio_size;

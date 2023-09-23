@@ -240,30 +240,32 @@ static int _ef10_nic_check_35388_workaround(struct efhw_nic *nic)
 }
 
 
-#define IP_LOCAL	(1 << MC_CMD_FILTER_OP_IN_MATCH_DST_IP_LBN |\
-			 1 << MC_CMD_FILTER_OP_IN_MATCH_DST_PORT_LBN |\
-			 1 << MC_CMD_FILTER_OP_IN_MATCH_ETHER_TYPE_LBN |\
-			 1 << MC_CMD_FILTER_OP_IN_MATCH_IP_PROTO_LBN)
-#define IP_FULL 	(1 << MC_CMD_FILTER_OP_IN_MATCH_DST_IP_LBN |\
-			 1 << MC_CMD_FILTER_OP_IN_MATCH_DST_PORT_LBN |\
-			 1 << MC_CMD_FILTER_OP_IN_MATCH_SRC_IP_LBN |\
-			 1 << MC_CMD_FILTER_OP_IN_MATCH_SRC_PORT_LBN |\
-			 1 << MC_CMD_FILTER_OP_IN_MATCH_ETHER_TYPE_LBN |\
-			 1 << MC_CMD_FILTER_OP_IN_MATCH_IP_PROTO_LBN)
-#define VLAN_IP_WILD	(1 << MC_CMD_FILTER_OP_IN_MATCH_DST_IP_LBN |\
-			 1 << MC_CMD_FILTER_OP_IN_MATCH_DST_PORT_LBN |\
-			 1 << MC_CMD_FILTER_OP_IN_MATCH_ETHER_TYPE_LBN |\
-			 1 << MC_CMD_FILTER_OP_IN_MATCH_OUTER_VLAN_LBN |\
-			 1 << MC_CMD_FILTER_OP_IN_MATCH_IP_PROTO_LBN)
-#define ETH_LOCAL	(1 << MC_CMD_FILTER_OP_IN_MATCH_DST_MAC_LBN)
-#define ETH_LOCAL_VLAN	(1 << MC_CMD_FILTER_OP_IN_MATCH_DST_MAC_LBN |\
-			 1 << MC_CMD_FILTER_OP_IN_MATCH_OUTER_VLAN_LBN)
-#define UCAST_MISMATCH	(1<<MC_CMD_FILTER_OP_IN_MATCH_UNKNOWN_UCAST_DST_LBN)
-#define MCAST_MISMATCH	(1<<MC_CMD_FILTER_OP_IN_MATCH_UNKNOWN_MCAST_DST_LBN)
-#define IP_PROTOCOL	(1 << MC_CMD_FILTER_OP_IN_MATCH_ETHER_TYPE_LBN |\
-			 1 << MC_CMD_FILTER_OP_IN_MATCH_IP_PROTO_LBN)
-#define ETHERTYPE	(1 << MC_CMD_FILTER_OP_IN_MATCH_ETHER_TYPE_LBN)
-
+#define MC_FILTER_IP_LOCAL	(1 << MC_CMD_FILTER_OP_IN_MATCH_DST_IP_LBN |\
+				 1 << MC_CMD_FILTER_OP_IN_MATCH_DST_PORT_LBN | \
+				 1 << MC_CMD_FILTER_OP_IN_MATCH_ETHER_TYPE_LBN | \
+				 1 << MC_CMD_FILTER_OP_IN_MATCH_IP_PROTO_LBN)
+#define MC_FILTER_IP_FULL 	(1 << MC_CMD_FILTER_OP_IN_MATCH_DST_IP_LBN |\
+				 1 << MC_CMD_FILTER_OP_IN_MATCH_DST_PORT_LBN | \
+				 1 << MC_CMD_FILTER_OP_IN_MATCH_SRC_IP_LBN | \
+				 1 << MC_CMD_FILTER_OP_IN_MATCH_SRC_PORT_LBN | \
+				 1 << MC_CMD_FILTER_OP_IN_MATCH_ETHER_TYPE_LBN | \
+				 1 << MC_CMD_FILTER_OP_IN_MATCH_IP_PROTO_LBN)
+#define MC_FILTER_VLAN_IP_WILD	(1 << MC_CMD_FILTER_OP_IN_MATCH_DST_IP_LBN |\
+				 1 << MC_CMD_FILTER_OP_IN_MATCH_DST_PORT_LBN | \
+				 1 << MC_CMD_FILTER_OP_IN_MATCH_ETHER_TYPE_LBN | \
+				 1 << MC_CMD_FILTER_OP_IN_MATCH_OUTER_VLAN_LBN | \
+				 1 << MC_CMD_FILTER_OP_IN_MATCH_IP_PROTO_LBN)
+#define MC_FILTER_ETH_LOCAL	(1 << MC_CMD_FILTER_OP_IN_MATCH_DST_MAC_LBN)
+#define MC_FILTER_ETH_LOCAL_VLAN (1 << MC_CMD_FILTER_OP_IN_MATCH_DST_MAC_LBN | \
+				  1 << MC_CMD_FILTER_OP_IN_MATCH_OUTER_VLAN_LBN)
+#define MC_FILTER_UCAST_MISMATCH (1<<MC_CMD_FILTER_OP_IN_MATCH_UNKNOWN_UCAST_DST_LBN)
+#define MC_FILTER_MCAST_MISMATCH (1<<MC_CMD_FILTER_OP_IN_MATCH_UNKNOWN_MCAST_DST_LBN)
+#define MC_FILTER_IP_PROTOCOL	(1 << MC_CMD_FILTER_OP_IN_MATCH_ETHER_TYPE_LBN |\
+				 1 << MC_CMD_FILTER_OP_IN_MATCH_IP_PROTO_LBN)
+#define MC_FILTER_ETHERTYPE	(1 << MC_CMD_FILTER_OP_IN_MATCH_ETHER_TYPE_LBN)
+#define MC_FILTER_MAC_IP4_PROTO	(1 << MC_CMD_FILTER_OP_IN_MATCH_ETHER_TYPE_LBN |\
+				 1 << MC_CMD_FILTER_OP_IN_MATCH_IP_PROTO_LBN |\
+				 1 << MC_CMD_FILTER_OP_IN_MATCH_DST_MAC_LBN)
 
 static int
 _ef10_ef100_nic_check_supported_filter(ci_dword_t* matches, int len, unsigned filter)
@@ -306,23 +308,25 @@ ef10_ef100_nic_check_supported_filters(struct efhw_nic *nic) {
 	/* We check types of filters that may be used by onload, or ef_vi
 	 * users.  This information will be exposed by the capabilities API.
 	 */
-	if( _ef10_ef100_nic_check_supported_filter(out, num_matches, IP_LOCAL) )
+	if( _ef10_ef100_nic_check_supported_filter(out, num_matches, MC_FILTER_IP_LOCAL) )
 		nic->flags |= NIC_FLAG_RX_FILTER_TYPE_IP_LOCAL;
-	if( _ef10_ef100_nic_check_supported_filter(out, num_matches, IP_FULL) )
+	if( _ef10_ef100_nic_check_supported_filter(out, num_matches, MC_FILTER_IP_FULL) )
 		nic->flags |= NIC_FLAG_RX_FILTER_TYPE_IP_FULL;
-	if( _ef10_ef100_nic_check_supported_filter(out, num_matches, VLAN_IP_WILD) )
+	if( _ef10_ef100_nic_check_supported_filter(out, num_matches, MC_FILTER_VLAN_IP_WILD) )
 		nic->flags |= NIC_FLAG_VLAN_FILTERS;
-	if( _ef10_ef100_nic_check_supported_filter(out, num_matches, ETH_LOCAL) )
+	if( _ef10_ef100_nic_check_supported_filter(out, num_matches, MC_FILTER_ETH_LOCAL) )
 		nic->flags |= NIC_FLAG_RX_FILTER_TYPE_ETH_LOCAL;
-	if( _ef10_ef100_nic_check_supported_filter(out, num_matches, ETH_LOCAL_VLAN) )
+	if( _ef10_ef100_nic_check_supported_filter(out, num_matches, MC_FILTER_ETH_LOCAL_VLAN) )
 		nic->flags |= NIC_FLAG_RX_FILTER_TYPE_ETH_LOCAL_VLAN;
-	if( _ef10_ef100_nic_check_supported_filter(out, num_matches, IP_PROTOCOL) )
+	if( _ef10_ef100_nic_check_supported_filter(out, num_matches, MC_FILTER_IP_PROTOCOL) )
 		nic->flags |= NIC_FLAG_RX_FILTER_IP4_PROTO;
-	if( _ef10_ef100_nic_check_supported_filter(out, num_matches, ETHERTYPE) )
+	if( _ef10_ef100_nic_check_supported_filter(out, num_matches, MC_FILTER_ETHERTYPE) )
 		nic->flags |= NIC_FLAG_RX_FILTER_ETHERTYPE;
-	if( _ef10_ef100_nic_check_supported_filter(out, num_matches, UCAST_MISMATCH) )
+	if( _ef10_ef100_nic_check_supported_filter(out, num_matches, MC_FILTER_MAC_IP4_PROTO) )
+		nic->flags |= NIC_FLAG_RX_FILTER_MAC_IP4_PROTO;
+	if( _ef10_ef100_nic_check_supported_filter(out, num_matches, MC_FILTER_UCAST_MISMATCH) )
 		nic->flags |= NIC_FLAG_RX_FILTER_TYPE_UCAST_MISMATCH;
-	if( _ef10_ef100_nic_check_supported_filter(out, num_matches, MCAST_MISMATCH) )
+	if( _ef10_ef100_nic_check_supported_filter(out, num_matches, MC_FILTER_MCAST_MISMATCH) )
 		nic->flags |= NIC_FLAG_RX_FILTER_TYPE_MCAST_MISMATCH;
 
 	/* All fw variants support IPv6 filters */
@@ -783,7 +787,7 @@ ef10_nic_tweak_hardware(struct efhw_nic *nic)
 	nic->flags |= NIC_FLAG_PIO | NIC_FLAG_HW_MULTICAST_REPLICATION |
 		      NIC_FLAG_PHYS_MODE | NIC_FLAG_BUFFER_MODE |
 		      NIC_FLAG_VPORTS | NIC_FLAG_RX_MCAST_REPLICATION |
-		      NIC_FLAG_USERSPACE_PRIME;
+		      NIC_FLAG_USERSPACE_PRIME | NIC_FLAG_SHARED_PD;
 
 	/* Determine what the filtering capabilies are */
 	ef10_ef100_nic_check_supported_filters(nic);
@@ -849,6 +853,9 @@ ef10_nic_init_hardware(struct efhw_nic *nic,
 
 	/* No buffer_table_ctor() on EF10 */
 	/* No non_irq_evq on EF10 */
+
+	nic->rss_indir_size = EF10_EF100_RSS_INDIRECTION_TABLE_LEN;
+	nic->rss_key_size = EF10_EF100_RSS_KEY_LEN;
 
 	return 0;
 }
@@ -1156,6 +1163,24 @@ static void ef10_nic_sw_event(struct efhw_nic *nic, int data, int evq)
 
 	ef10_ef100_mcdi_cmd_driver_event(nic, ev_data, evq);
 	EFHW_TRACE("%s: evq[%d]->%x", __FUNCTION__, evq, data);
+}
+
+
+bool ef10_ef100_accept_vi_constraints(struct efhw_nic *nic, int low,
+				      unsigned order, void* arg)
+{
+	struct efhw_vi_constraints *avc = arg;
+	int high = low + avc->min_vis_in_set;
+	int ok = 1;
+	if ((avc->min_vis_in_set > 1) && (!avc->has_rss_context)) {
+		/* We need to ensure that if an RSS-enabled filter is
+		 * pointed at this VI-set then the queue selected will be
+		 * within the default set.  The queue selected by RSS will be 
+		 * in the range (low | (rss_channel_count - 1)).
+		 */
+		ok &= ((low | (nic->rss_channel_count - 1)) < high);
+	}
+	return ok;
 }
 
 /*--------------------------------------------------------------------
@@ -1726,6 +1751,12 @@ ef10_dmaq_rx_q_init(struct efhw_nic *nic, uint32_t client_id,
 	return rc == 0 ?
 		flag_rx_prefix ? nic->rx_prefix_len : 0 :
 		rc;
+}
+
+int ef10_ef100_design_parameters(struct efhw_nic *nic,
+                                 struct efab_nic_design_parameters *dp)
+{
+	return 0;
 }
 
 size_t ef10_ef100_max_shared_rxqs(struct efhw_nic *nic)
@@ -2302,10 +2333,15 @@ ef10_vi_set_user(struct efhw_nic *nic, uint32_t vi_instance, uint32_t user)
  *--------------------------------------------------------------------*/
 int
 ef10_ef100_rss_alloc(struct efhw_nic *nic, const u32 *indir, const u8 *key,
-		     u32 nic_rss_flags, int num_qs, u32 *rss_context_out)
+		     u32 efhw_rss_mode, int num_qs, u32 *rss_context_out)
 {
 	int rc;
 	struct efx_dl_device *efx_dev = efhw_nic_acquire_dl_device(nic);
+	u32 nic_rss_flags;
+
+	rc = ef10_ef100_rss_mode_to_nic_flags(nic, efhw_rss_mode, &nic_rss_flags);
+	if (rc < 0)
+		return rc;
 
 	if (efx_dev == NULL)
 		return -ENETDOWN;
@@ -2317,10 +2353,15 @@ ef10_ef100_rss_alloc(struct efhw_nic *nic, const u32 *indir, const u8 *key,
 
 int
 ef10_ef100_rss_update(struct efhw_nic *nic, const u32 *indir, const u8 *key,
-		      u32 nic_rss_flags, u32 rss_context)
+		      u32 efhw_rss_mode, u32 rss_context)
 {
 	int rc;
 	struct efx_dl_device *efx_dev = efhw_nic_acquire_dl_device(nic);
+	u32 nic_rss_flags;
+
+	rc = ef10_ef100_rss_mode_to_nic_flags(nic, efhw_rss_mode, &nic_rss_flags);
+	if (rc < 0)
+		return rc;
 
 	if (efx_dev == NULL)
 		return -ENETDOWN;
@@ -2355,9 +2396,69 @@ ef10_ef100_rss_flags(struct efhw_nic *nic, u32 *flags_out)
 	return 0;
 }
 
+int ef10_ef100_rss_mode_to_nic_flags(struct efhw_nic *efhw_nic,
+					u32 rss_mode, u32 *flags_out)
+{
+	int rc;
+	u32 rss_flags;
+	u32 nic_tcp_mode;
+	u32 nic_src_mode = (1 << RSS_MODE_HASH_SRC_ADDR_LBN) |
+			   (1 << RSS_MODE_HASH_SRC_PORT_LBN);
+	u32 nic_dst_mode = (1 << RSS_MODE_HASH_DST_ADDR_LBN) |
+			   (1 << RSS_MODE_HASH_DST_PORT_LBN);
+	u32 nic_all_mode = nic_src_mode | nic_dst_mode;
+	ci_dword_t nic_flags_new;
+	ci_dword_t nic_flags_mask;
+
+	rc = ef10_ef100_rss_flags(efhw_nic, &rss_flags);
+	if( rc < 0 )
+		return rc;
+
+        /* we need to use default flags in packed stream mode,
+         * note in that case TCP hashing will surely be enabled,
+         * so nothing to do there anyway */
+        if( efhw_nic->flags & NIC_FLAG_RX_RSS_LIMITED ) {
+		*flags_out = rss_flags;
+		return 0;
+	}
+
+	switch(rss_mode) {
+	case EFHW_RSS_MODE_SRC:
+		nic_tcp_mode = nic_src_mode;
+		break;
+	case EFHW_RSS_MODE_DST:
+		nic_tcp_mode = nic_dst_mode;
+		break;
+	case EFHW_RSS_MODE_DEFAULT:
+		nic_tcp_mode = nic_all_mode;
+		break;
+	default:
+		EFHW_ASSERT(!"Unknown rss mode");
+		return -EINVAL;
+	};
+
+	CI_POPULATE_DWORD_2(nic_flags_mask,
+		MC_CMD_RSS_CONTEXT_SET_FLAGS_IN_TOEPLITZ_TCPV4_EN,
+                     (1 << MC_CMD_RSS_CONTEXT_SET_FLAGS_IN_TOEPLITZ_IPV4_EN_WIDTH) - 1,
+		MC_CMD_RSS_CONTEXT_SET_FLAGS_IN_TCP_IPV4_RSS_MODE,
+                     ( efhw_nic->flags & NIC_FLAG_ADDITIONAL_RSS_MODES ) ?
+                     (1 << MC_CMD_RSS_CONTEXT_SET_FLAGS_IN_TCP_IPV4_RSS_MODE_WIDTH) - 1 :
+                     0
+		);
+	CI_POPULATE_DWORD_2(nic_flags_new,
+		MC_CMD_RSS_CONTEXT_SET_FLAGS_IN_TOEPLITZ_TCPV4_EN, 1,
+		MC_CMD_RSS_CONTEXT_SET_FLAGS_IN_TCP_IPV4_RSS_MODE, nic_tcp_mode
+		);
+        EFHW_ASSERT((nic_flags_new.u32[0] & nic_flags_mask.u32[0]) == nic_flags_new.u32[0]);
+	*flags_out = (rss_flags & ~nic_flags_mask.u32[0]) |
+		     nic_flags_new.u32[0];
+	return 0;
+}
+
 int
 ef10_ef100_filter_insert(struct efhw_nic *nic, struct efx_filter_spec *spec,
-			 int *rxq, const struct cpumask *mask, unsigned flags)
+						int *rxq, unsigned pd_excl_token, const struct cpumask *mask,
+						unsigned flags)
 {
 	int rc;
 	struct efx_dl_device *efx_dev = efhw_nic_acquire_dl_device(nic);
@@ -2415,6 +2516,13 @@ ef10_ef100_filter_redirect(struct efhw_nic *nic, int filter_id,
 					    stack_id);
 	efhw_nic_release_dl_device(nic, efx_dev);
 	return rc;
+}
+
+int
+ef10_ef100_filter_query(struct efhw_nic *nic, int filter_id,
+                        struct efhw_filter_info *info)
+{
+  return -EOPNOTSUPP;
 }
 
 int
@@ -2598,6 +2706,7 @@ struct efhw_func_ops ef10_char_functional_units = {
 	ef10_nic_wakeup_request,
 	ef10_nic_sw_event,
 	ef10_handle_event,
+	ef10_ef100_accept_vi_constraints,
 	ef10_dmaq_tx_q_init,
 	ef10_dmaq_rx_q_init,
 	ef10_ef100_flush_tx_dma_channel,
@@ -2626,10 +2735,10 @@ struct efhw_func_ops ef10_char_functional_units = {
 	ef10_ef100_rss_alloc,
 	ef10_ef100_rss_update,
 	ef10_ef100_rss_free,
-	ef10_ef100_rss_flags,
 	ef10_ef100_filter_insert,
 	ef10_ef100_filter_remove,
 	ef10_ef100_filter_redirect,
+	ef10_ef100_filter_query,
 	ef10_ef100_multicast_block,
 	ef10_ef100_unicast_block,
 	ef10_ef100_vport_alloc,
@@ -2641,5 +2750,6 @@ struct efhw_func_ops ef10_char_functional_units = {
 	ef10_vi_io_region,
 	ef10_inject_reset_ev,
 	ef10_ctpio_addr,
+        ef10_ef100_design_parameters,
 	ef10_ef100_max_shared_rxqs,
 };

@@ -483,7 +483,9 @@ int efab_file_move_to_alien_stack(ci_private_t *priv, ci_netif *alien_ni,
     ci_tcp_rx_queue_drop(&old_thr->netif, old_ts, &old_ts->recv1);
     ci_tcp_rx_queue_drop(&old_thr->netif, old_ts, &old_ts->recv2);
     new_ts->recv1_extract = new_ts->recv1.head;
-    
+    /* Old extract pointer can still get used during reaping */
+    old_ts->recv1_extract = old_ts->recv1.head;
+
     /* Ensure we update rcv_added with the data received in the last
      * ci_netif_poll(). */
     new_ts->rcv_added = old_ts->rcv_added;
@@ -793,6 +795,7 @@ int efab_tcp_loopback_connect(ci_private_t *priv, void *arg)
          * todo: no hardware interfaces are necessary */
         strcpy(alloc.in_version, onload_short_version);
         strcpy(alloc.in_uk_intf_ver, oo_uk_intf_ver);
+        alloc.in_pktbuf_memfd = -1;
 
         /* There will be no more active connections in the new stack
          * - tcp_shared_local_ports is useless. */

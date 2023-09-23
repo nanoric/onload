@@ -81,6 +81,9 @@ struct efrm_pd {
 	/* Unique ID allocated by the NIC for all NIC resources in this pd */
 	uint32_t nic_client_id;
 
+	/* cookie used to claim exclusive ownership of an efct RXQ. */
+	unsigned exclusive_rxq_token; 
+
 	/* serializes remapping of buffers on NIC reset */
 	struct mutex remap_lock;
 
@@ -231,6 +234,11 @@ unsigned efrm_pd_stack_id_get(struct efrm_pd *pd)
 }
 EXPORT_SYMBOL(efrm_pd_stack_id_get);
 
+unsigned efrm_pd_exclusive_rxq_token_get(struct efrm_pd *pd)
+{
+       return pd->exclusive_rxq_token;
+}
+EXPORT_SYMBOL(efrm_pd_exclusive_rxq_token_get);
 
 /***********************************************************************/
 
@@ -249,10 +257,19 @@ int efrm_pd_alloc(struct efrm_pd **pd_out, struct efrm_client *client_opt,
 	    ~(EFRM_PD_ALLOC_FLAG_PHYS_ADDR_MODE |
 	    EFRM_PD_ALLOC_FLAG_HW_LOOPBACK |
 	    EFRM_PD_ALLOC_FLAG_WITH_CLIENT_ID |
-	    EFRM_PD_ALLOC_FLAG_WITH_CLIENT_ID_OPT)) != 0) {
+	    EFRM_PD_ALLOC_FLAG_WITH_CLIENT_ID_OPT |
+	    EFRM_PD_ALLOC_CLUSTER)) != 0) {
 		rc = -EINVAL;
 		goto fail1;
 	}
+
+	/* If this is pd is intended to manage a cluster we only want to
+	 * allocate buffer table if it will be shared. Otherwise each cluster
+	 * member will allocate a separate pd to manage its own buffers.
+	 */
+	if( !(client_opt->nic->flags & NIC_FLAG_SHARED_PD) &&
+	     (flags & EFRM_PD_ALLOC_CLUSTER) )
+		use_buffer_table = 0;
 
 	/* NICs that do not use a buffer table will report 0 orders. For
 	 * compatability we don't care whether buffer table or phys mode has
@@ -302,6 +319,8 @@ int efrm_pd_alloc(struct efrm_pd **pd_out, struct efrm_client *client_opt,
 
 	spin_lock_bh(&pd_manager->rm.rm_lock);
 	instance = pd_manager->next_instance++;
+	pd->exclusive_rxq_token = pd_manager->next_instance;
+
 	if (!use_buffer_table) {
 		pd->owner_id = OWNER_ID_PHYS_MODE;
 	}
@@ -443,13 +462,6 @@ uint32_t efrm_pd_get_nic_client_id(struct efrm_pd *pd)
 	return pd->nic_client_id;
 }
 EXPORT_SYMBOL(efrm_pd_get_nic_client_id);
-
-
-int efrm_pd_share_dma_mapping(struct efrm_pd *pd, struct efrm_pd *pd1)
-{
-	return false;
-}
-EXPORT_SYMBOL(efrm_pd_share_dma_mapping);
 
 
 int

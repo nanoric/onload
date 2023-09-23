@@ -52,6 +52,7 @@
 #include <linux/uaccess.h>
 #include <linux/syscalls.h>
 #include <linux/fdtable.h>
+#include <linux/file.h>
 #include <asm/syscall.h>
 #include <net/sock.h>
 #include <linux/filter.h>
@@ -169,8 +170,26 @@ static inline void unpin_user_page(struct page *page)
 {
   put_page(page);
 }
+
+static inline void unpin_user_pages(struct page **pages, unsigned long npages)
+{
+  int i;
+
+  for( i = 0; i < npages; i++ )
+    put_page(pages[i]);
+}
 #endif
 
+#ifndef EFRM_GUP_HAS_DMA_PINNED
+/* page_maybe_dma_pinned() was not added at the same time as pin_user_pages(),
+ * but shortly after, around linux-5.7. We could mimic it, but the real value
+ * for us is the post linux-6.1 kernels, which may change the pinning semantics
+ * and break our assumptions that vm_munmap() does not unpin pages. */
+static inline bool page_maybe_dma_pinned(struct page *page)
+{
+  return true;
+}
+#endif
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,10,0)
 #define VM_FAULT_ADDRESS(_vmf) (_vmf)->address
@@ -409,5 +428,38 @@ oo_remap_vmalloc_range_partial(struct vm_area_struct *vma, unsigned long uaddr,
 #else
 #define ci_netif_rx_non_irq netif_rx
 #endif /* EFRM_HAVE_NETIF_RX_NI */
+
+#ifndef EFRM_HAVE_VM_FLAGS_SET
+/* Linux < 6.3 */
+static inline void vm_flags_set(struct vm_area_struct *vma, vm_flags_t flags)
+{
+  vma->vm_flags |= flags;
+}
+static inline void vm_flags_clear(struct vm_area_struct *vma, vm_flags_t flags)
+{
+  vma->vm_flags &= ~flags;
+}
+#endif /* EFRM_HAVE_VM_FLAGS_SET */
+
+#ifndef EFRM_HAVE_GET_RANDOM_U32
+/* linux < 4.11 */
+static inline u32 get_random_u32(void)
+{
+	return get_random_int();
+}
+#endif
+
+#ifdef EFRM_CLASS_CREATE_NO_MODULE
+/* linux >= 6.4 */
+/* NOTE: there are revisions between linux-6.3 and linux-6.4 where
+ *       'class_create' is defined as follows:
+ *       #define class_create(name)
+ *       Such definition is not handled by this compat code, so build is broken
+ *       on those revisions. It does not involve any release Linux versions, but
+ *       you may face build problems when bisecting Linux. */
+#define ci_class_create(__name) class_create(__name)
+#else
+#define ci_class_create(__name) class_create(THIS_MODULE, __name)
+#endif
 
 #endif /* DRIVER_LINUX_RESOURCE_KERNEL_COMPAT_H */

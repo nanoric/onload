@@ -93,6 +93,11 @@ int             cfg_zombie = 0;
 int             cfg_nopids = 0;
 const char*     cfg_filter = NULL;
 
+/* 
+ * In stackdump universe option: We need to print filters ouput and table only once. 
+ * Use this global var to prevent it from printing on every stack.
+ */
+int universe_print_once = 1;
 
 ci_inline void libstack_defer_signals(citp_signal_info* si)
 {
@@ -400,39 +405,39 @@ void libstack_stack_mapping_print(void)
     return;
 
   if( cfg_nopids )
-    printf("#stack-id stack-name\n");
+    ci_log("#stack-id stack-name");
   else
-    printf("#stack-id stack-name      pids\n");
+    ci_log("#stack-id stack-name      pids");
 
   for( sm = stack_mappings; sm != NULL; sm = sm->next ) {
-    printf("%-9d ", sm->stack_id);
+    ci_log_nonl("%-9d ", sm->stack_id);
 
     stack_attach(sm->stack_id);
     netif_t* netif = stack_attached(sm->stack_id);
 
     if( netif == NULL ) {
-      printf("unaccessable\n");
+      ci_log("inaccessible");
       continue;
     }
     if( ! netif->ni.state )
-      printf("<zombie>        ");
+      ci_log_nonl("<zombie>        ");
     else if( strlen(netif->ni.state->name) != 0 )
-      printf("%-16s", netif->ni.state->name);
+      ci_log_nonl("%-16s", netif->ni.state->name);
     else
-      printf("-               ");
+      ci_log_nonl("-               ");
 
     if( !cfg_nopids ) {
       if( sm->n_pids == 0 )
-        printf("-");
+        ci_log_nonl("-");
       else {
         for( i = 0; i < sm->n_pids; ++i ) {
-          printf("%d", sm->pids[i]);
+          ci_log_nonl("%d", sm->pids[i]);
           if( i != sm->n_pids - 1 )
-            printf(",");
+            ci_log_nonl(",");
         }
       }
     }
-    printf("\n");
+    ci_log(" ");
   }
 }
 
@@ -446,13 +451,13 @@ static void print_cmdline(int pid)
   while( (cnt = read(cmdline, buf, MAX_PATHNAME)) > 0 ) {
     for( i = 0; i < cnt; ++i ) {
       if( buf[i] == '\0' )
-        printf(" ");
+        ci_log_nonl(" ");
       else
-        printf("%c", buf[i]);
+        ci_log_nonl("%c", buf[i]);
     }
   }
   close(cmdline);
-  printf("\n");
+  ci_log(" ");
 }
 
 void libstack_pid_mapping_print(void)
@@ -473,30 +478,30 @@ void libstack_pid_mapping_print(void)
     pm = pm->next;
   }
 
-  printf("#pid      stack-id");
+  ci_log_nonl("#pid      stack-id");
   if( max_spacing > strlen("stack-id") ) {
     for(i = 0; i < max_spacing - strlen("stack-id") - 1; ++i )
-      printf(" ");
+      ci_log_nonl(" ");
   }
   else
-    printf(" ");
-  printf("cmdline\n");
+    ci_log_nonl(" ");
+  ci_log("cmdline");
 
   pm = pid_mappings;
   while( pm ) {
-    printf("%-10d", pm->pid);
+    ci_log_nonl("%-10d", pm->pid);
     for( i = 0; i < pm->n_stack_ids; ++i ) {
-      printf("%d", pm->stack_ids[i]);
+      ci_log_nonl("%d", pm->stack_ids[i]);
       if( i != pm->n_stack_ids - 1 )
-        printf(",");
+        ci_log_nonl(",");
     }
     if( max_spacing > strlen("stack-id") ) {
       for( i = 0; i < max_spacing - pm->n_stack_ids * 2; ++i )
-        printf(" ");
+        ci_log_nonl(" ");
     }
     else {
       for( i = 0; i < strlen("stack-id") - pm->n_stack_ids * 2 + 2; ++i )
-        printf(" ");
+        ci_log_nonl(" ");
     }
 
     print_cmdline(pm->pid);
@@ -535,7 +540,7 @@ int libstack_threads_print(void)
 
   struct pid_mapping* pm = pid_mappings;
 
-  printf("#pid thread affinity priority realtime\n");
+  ci_log("#pid thread affinity priority realtime");
 
   while( pm ) {
     snprintf(task_path, MAX_PATHNAME, "/proc/%d/task", pm->pid);
@@ -546,7 +551,7 @@ int libstack_threads_print(void)
       if( ent->d_name[0] == '.' )
         continue;
 
-      printf("%d %s ", pm->pid, ent->d_name);
+      ci_log_nonl("%d %s ", pm->pid, ent->d_name);
 
       /* task affinity */
       char file_path[MAX_PATHNAME];
@@ -564,7 +569,7 @@ int libstack_threads_print(void)
         ++ptr;
       char* newline = strchr(ptr, '\n');
       *newline = '\0';
-      printf("%s ", ptr);
+      ci_log_nonl("%s ", ptr);
       fclose(status);
 
       snprintf(file_path, MAX_PATHNAME, "/proc/%d/task/%s/stat",
@@ -577,15 +582,15 @@ int libstack_threads_print(void)
       }
       if( get_int_from_tok_str(&buf[cnt], " ", 15, &cnt) ) {
         if( cnt < 0 )
-          printf("%ld 1\n", (-cnt)-1);
+          ci_log_nonl("%ld 1\n", (-cnt)-1);
         else
-          printf("%ld 0\n", cnt-20);
+          ci_log_nonl("%ld 0\n", cnt-20);
       }
       else
-        printf("N/A N/A");
+        ci_log_nonl("N/A N/A");
 
       if( pm->next )
-        printf("\n");
+        ci_log(" ");
     }
     pm = pm->next;
     closedir(task_dir);
@@ -617,11 +622,11 @@ static void print_env(char* buf, int file_len)
     char* var = buf;
     while( var ) {
       if( ! strncmp(var, "EF_", strlen("EF_")) )
-        printf("env: %s\n", var);
+        ci_log_nonl("env: %s\n", var);
       if( ! strncmp(var, "LD_PRELOAD", strlen("LD_PRELOAD")) )
-        printf("env: %s\n", var);
+        ci_log_nonl("env: %s\n", var);
       if( ! strncmp(var, "TP_LOG", strlen("TP_LOG")) )
-        printf("env: %s\n", var);
+        ci_log_nonl("env: %s\n", var);
       while( *var != '\0' )
         ++var;
       ++var;
@@ -643,9 +648,9 @@ int libstack_env_print(void)
 
   struct pid_mapping* pm = pid_mappings;
   while( pm ) {
-    printf("--------------------------------------------\n");
-    printf("pid: %d\n", pm->pid);
-    printf("cmdline: ");
+    ci_log("--------------------------------------------");
+    ci_log("pid: %d", pm->pid);
+    ci_log_nonl("cmdline: ");
     print_cmdline(pm->pid);
     char env_path[MAX_PATHNAME];
     snprintf(env_path, MAX_PATHNAME, "/proc/%d/environ", pm->pid);
@@ -669,7 +674,7 @@ int libstack_env_print(void)
     print_env(buf, file_len);
     pm = pm->next;
   }
-  printf("--------------------------------------------\n");
+  ci_log("--------------------------------------------");
   return 0;
 }
 
@@ -906,13 +911,13 @@ static void print_stats_header_line(const stat_desc_t* stats_fields,
   const stat_desc_t* s;
   int j, i = 1;
 
-  printf("#\ttime(%d)", i++);
+  ci_log_nonl("#\ttime(%d)", i++);
   for( s = stats_fields; s < stats_fields + n_stats_fields; ++s )
-    printf("\t%s(%d)", s->name, i++);
-  printf("\n");
+    ci_log_nonl("\t%s(%d)", s->name, i++);
+  ci_log(" ");
   printf("#");
-  for( j = 1; j < i; ++j )  printf("\t(%d)", j);
-  printf("\n");
+  for( j = 1; j < i; ++j )  ci_log_nonl("\t(%d)", j);
+  ci_log(" ");
 }
 
 
@@ -970,7 +975,7 @@ static void watch_stats(const stat_desc_t* stats_fields, int n_stats_fields,
         ci_log("%30s: %llu", s->name, v);
     }
     if( ! cfg_notable ) {
-      printf("%s\n", line);
+      ci_log("%s", line);
       fflush(stdout);
     }
   }
@@ -1050,7 +1055,7 @@ static int dump_via_buffers(oo_dump_request_fn_t dump_req_fn, void* arg,
     }
     rc = dump_req_fn(arg, buf, buf_len);
     if( rc >= 0 && rc <= buf_len )
-      printf("%s", buf);
+      ci_log_nonl("%s", buf);
     free(buf);
     if( rc < 0 ) {
       if( flags & DVB_LOG_FAILURE )
@@ -1549,7 +1554,7 @@ static void stack_unlock(ci_netif* ni)
 static void stack_netif_unlock(ci_netif* ni)
 {
   if( cfg_lock )
-    ci_log("stupid");
+    ci_log("%s: already locked due to --lock option", __FUNCTION__);
   else {
     if( ! ci_netif_is_locked(ni) )
       ci_log("%d: not locked", NI_ID(ni));
@@ -2058,10 +2063,12 @@ static void stack_set_rxq_limit(ci_netif* ni)
 
 static void process_dump(ci_netif* ni)
 {
+  char task_path[MAX_PATHNAME];
+  char buf[MAX_PATHNAME];
   struct stack_mapping* sm = stack_mappings;
     
   if( cfg_nopids ){ //pid mappings not available
-    printf("No environment state as --nopids set on command line\n");
+    ci_log("No environment state as --nopids set on command line");
     return;
   }
 
@@ -2070,48 +2077,165 @@ static void process_dump(ci_netif* ni)
   while( sm && sm->stack_id != stack_id )
     sm = sm->next;
   if( sm == NULL ) {
-    printf("No stack_mapping for stack %d found", stack_id);
+    ci_log_nonl("No stack_mapping for stack %d found", stack_id);
     return;
   }
   
   int i, pid;
   for( i = 0; i < sm->n_pids; ++i ) {
     pid = sm->pids[i];
+    ci_log("--------------------------------------------");
+    snprintf(task_path, MAX_PATHNAME, "/proc/%d/task", pid);
+    DIR* task_dir = opendir(task_path);
+    /* check if open directory succeeded */
+    if ( task_dir == NULL ) {
+      ci_log("failed reading /proc/%d/task directory. error: %s", pid, strerror(errno));
+      exit(1);
+    }
+    struct dirent* ent;
 
-    printf("--------------------------------------------\n");
-    printf("pid: %d\n", pid);
-    printf("cmdline: ");
+    while( (ent = readdir(task_dir)) ) {
+      if( ent->d_name[0] == '.' )
+        continue;
+
+      ci_log_nonl("PID: %d Thread: %s", (int) sm->pids[i], ent->d_name);
+      char file_path[MAX_PATHNAME];
+      snprintf(file_path, MAX_PATHNAME, "/proc/%d/task/%s/status",(int) sm->pids[i], ent->d_name);
+      /* open the command line */
+      FILE* status = fopen(file_path, "r");
+      /* check if fopen succeeded */
+      if ( status == NULL ) {
+        ci_log("failed reading the /proc/%d/task/%s/status file. error: %s",(int) sm->pids[i], ent->d_name, strerror(errno));
+        exit(1);
+      }
+      char line[1024];
+      char values[3][256];
+      char labels[][256] = {
+        "Cpus_allowed:",
+        "voluntary_ctxt_switches:",
+        "nonvoluntary_ctxt_switches:"
+      };
+
+      int j;
+      /* check each line in the file */
+      while( fgets(line, sizeof(line), status) != NULL ) {
+        /* we're looking for three counters */
+        for( j = 0; j < 3; j++ ) {
+          int len = strlen(labels[j]);
+          /* find the required counter */
+          if( strncmp(line, labels[j], len) == 0 ) {
+            char *tmp = line + len;
+            /* remove the first character. 
+            ** output of counters in /proc/pid/task/pid/status (from source code) 
+            ** contains /t character as the first character. */
+            tmp++;
+            /* remove newline and print */
+            tmp[strcspn(tmp, "\n")] = '\0';
+            /* Copy the counter values in array and later print them */
+            strncpy(values[j], tmp, (sizeof(tmp)-1));
+            /* extra safety: terminating the string */
+            values[i][sizeof(values[j]) - 1] = 0;
+          }
+        }
+      }
+      ci_log_nonl(" Cpus_allowed: %s voluntary_ctxt_switches: %s nonvoluntary_ctxt_switches: %s",values[0],values[1],values[2]);
+      fclose(status);
+      /* read /proc/pid/task/pid/stat */
+      snprintf(file_path, MAX_PATHNAME, "/proc/%d/task/%s/stat",(int) sm->pids[i], ent->d_name);
+      int stat = open(file_path, O_RDONLY);
+      /* check if open succeeded */
+      if ( stat == -1 ) {
+        ci_log("failed reading /proc/%d/task/%s/stat file. error: %s",(int) sm->pids[i], ent->d_name,strerror(errno));
+        exit(1);
+      }
+      long cnt = read(stat, buf, MAX_PATHNAME);
+      close(stat);
+
+      while( cnt && (buf[cnt-1] != ')') ) {
+        cnt--;
+      }
+      /* get the values for priority and realtime for the threads */
+      if( get_int_from_tok_str(&buf[cnt], " ", 15, &cnt) ) { 
+        if( cnt < 0 ) {
+          ci_log_nonl(" priority: %ld realtime: 1\n", (-cnt)-1 );
+        }    
+        else {
+          ci_log_nonl(" priority: %ld realtime: 0\n", cnt-20 );
+        }
+      }
+      else {
+        ci_log_nonl("priority: N/A realtime: N/A");
+      }
+    }
+    closedir(task_dir);
+    
+    ci_log_nonl("cmdline: ");
     print_cmdline(pid);
     char env_path[MAX_PATHNAME];
     snprintf(env_path, MAX_PATHNAME, "/proc/%d/environ", pid);
 
     int file_len = get_file_size(env_path);
     if( file_len == -1 ){
-      printf("error: got file size -1 for pid %d\n", pid);
+      ci_log("error: got file size -1 for pid %d", pid);
       continue;
     }
 
     char* buf = calloc(file_len, sizeof(*buf));
     int env = open(env_path, O_RDONLY);
     if( env == -1 ){ //failed to open the env path
-      printf("error: failed to open env for pid %d\n", pid);
+      ci_log("error: failed to open env for pid %d", pid);
       continue;
     }
     int rc = read(env, buf, file_len);
     if( rc == -1 ){ //failed to read the env file
-      printf("error: failed to read env for pid %d\n", pid);
+      ci_log("error: failed to read env for pid %d", pid);
       continue;
     }
     if( rc != file_len ) {
-      printf("error: read less than the expected amount for pid %d\n", pid);
+      ci_log("error: read less than the expected amount for pid %d", pid);
       continue;
     }
 
     print_env(buf, file_len);
   }
-  printf("--------------------------------------------\n");
+  ci_log("--------------------------------------------");
 }
 
+
+static void stack_universe(ci_netif* ni)
+{
+  if(universe_print_once == 1){
+    ci_log("--------------------- Filters output  ------------------------------");
+    ci_netif_filter_dump(ni);
+    filter_dump_args args = {ci_netif_get_driver_handle(ni), OO_SP_NULL};
+    dump_via_buffers(ci_tcp_helper_ep_filter_dump, &args, DVB_LOG_FAILURE);
+    universe_print_once = 0;
+  }
+  ci_log("============================================================");
+  ci_netif_dump(ni);
+  ci_netif_dump_extra(ni);
+  libstack_stack_mapping_print_pids(NI_ID(ni));
+  ci_log("--------------------- sockets ------------------------------");
+  ci_netif_dump_sockets(ni);
+  stack_stats(ni);
+  stack_more_stats(ni);
+
+#if CI_CFG_SUPPORT_STATS_COLLECTION
+  stack_ip_stats(ni);
+  stack_tcp_stats(ni);
+  stack_tcp_ext_stats(ni);
+  stack_udp_stats(ni);
+#endif
+  
+  ci_log("--------------------- vi stats ------------------------------");
+  ci_netif_dump_vi_stats(ni);
+  ci_log("--------------------- config opts --------------------------");
+  ci_netif_config_opts_dump(&NI_OPTS(ni), NULL, NULL);
+  ci_log("--------------------- stack time ---------------------------");
+  stack_time(ni);
+  ci_log("--------------------- process env --------------------------");
+  process_dump(ni);
+}
 
 static void stack_lots(ci_netif* ni)
 {
@@ -2137,7 +2261,6 @@ static void stack_lots(ci_netif* ni)
   stack_time(ni);
   ci_log("--------------------- process env --------------------------");
   process_dump(ni);
-  fflush(NULL);
 }
 
 static void stack_describe_stats(ci_netif* ni){
@@ -2295,6 +2418,7 @@ static const stack_op_t stack_ops[] = {
   STACK_OP_A(get_opt,          "get stack option", "<name>", 1, FL_ARG_S),
   STACK_OP_AU(set_rxq_limit,   "set the rxq_limit", "<limit>"),
   STACK_OP(lots,               "dump state, opts, stats"),
+  STACK_OP(universe,           "filters, vi stats, threads with context switches, dump state, opts, stats"),
   STACK_OP(reap_list,          "dump list of sockets on the reap_list"),
   STACK_OP(reap_list_verbose,  "dump sockets on the reap_list"),
   STACK_OP(pkt_reap,           "reap packet buffers from sockets"),
@@ -2534,7 +2658,7 @@ void sockets_watch_bw(void)
     sockets_bw_poll(i);
   }
 
-  printf("# usec delta");
+  ci_log_nonl("# usec delta");
   for( s = sockets; s < sockets + sockets_n; ++s ) {
     ci_uint32 be32;
     netif_t* n = stacks[s->stack];
@@ -2542,9 +2666,9 @@ void sockets_watch_bw(void)
     wo = SP_TO_WAITABLE_OBJ(&n->ni, s->id);
     if( ! is_tcp_stream(wo) )  continue;
     be32 = tcp_raddr_be32(&wo->tcp);
-    printf(" "CI_IP_PRINTF_FORMAT,CI_IP_PRINTF_ARGS(&be32));
+    ci_log_nonl(" "CI_IP_PRINTF_FORMAT,CI_IP_PRINTF_ARGS(&be32));
   }
-  printf("\n");
+  ci_log(" ");
   blen = sockets_n * 2 * 10 + 20;
   CI_TEST(b = (char*) malloc(blen));
 
@@ -2561,7 +2685,7 @@ void sockets_watch_bw(void)
                            SEQ_SUB(sam[i].rx, sam[i-1].rx),
                            SEQ_SUB(sam[i].tx, sam[i-1].tx));
     }
-    printf("%s\n", b);
+    ci_log("%s", b);
   }
 
   free(b);
@@ -2597,7 +2721,7 @@ void sockets_bw(void)
     txbw = (unsigned) ((ci_uint64) (sam[1].tx - sam[0].tx) * 8 / usec);
     rxbw = (unsigned) ((ci_uint64) (sam[1].rx - sam[0].rx) * 8 / usec);
     if( txbw || rxbw )
-      printf("%d:%d  %d %d\n", NI_ID(&n->ni), s->id, txbw, rxbw);
+      ci_log("%d:%d  %d %d", NI_ID(&n->ni), s->id, txbw, rxbw);
   }
 
   for( s = sockets; s < sockets + sockets_n; ++s )  free(s->s);

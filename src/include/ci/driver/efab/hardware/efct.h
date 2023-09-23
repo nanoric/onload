@@ -34,15 +34,29 @@
 
 #define EFCT_RX_HEADER_L2_CLASS_LBN 32
 #define EFCT_RX_HEADER_L2_CLASS_WIDTH 2
+#define EFCT_RX_HEADER_L2_CLASS_ETH_01VLAN 1
+#define EFCT_RX_HEADER_L2_CLASS_OTHER 0
 
 #define EFCT_RX_HEADER_L3_CLASS_LBN 34
 #define EFCT_RX_HEADER_L3_CLASS_WIDTH 2
+#define EFCT_RX_HEADER_L3_CLASS_IP4 0
+#define EFCT_RX_HEADER_L3_CLASS_IP6 1
+#define EFCT_RX_HEADER_L3_CLASS_OTHER 2
+#define EFCT_RX_HEADER_L3_CLASS_RESERVED 3
 
 #define EFCT_RX_HEADER_L4_CLASS_LBN 36
 #define EFCT_RX_HEADER_L4_CLASS_WIDTH 2
+#define EFCT_RX_HEADER_L4_CLASS_TCP 0
+#define EFCT_RX_HEADER_L4_CLASS_UDP 1
+#define EFCT_RX_HEADER_L4_CLASS_FRAGMENT 2
+#define EFCT_RX_HEADER_L4_CLASS_OTHER 3
 
 #define EFCT_RX_HEADER_L2_STATUS_LBN 38
 #define EFCT_RX_HEADER_L2_STATUS_WIDTH 2
+#define EFCT_RX_HEADER_L2_STATUS_LBN 38
+#define EFCT_RX_HEADER_L2_STATUS_WIDTH 2
+#define EFCT_RX_HEADER_L2_STATUS_LEN_ERR 1
+#define EFCT_RX_HEADER_L2_STATUS_FCS_ERR 2
 
 #define EFCT_RX_HEADER_L3_STATUS_LBN 40
 #define EFCT_RX_HEADER_L3_STATUS_WIDTH 1
@@ -83,7 +97,6 @@
 #define EFCT_EVENT_TYPE_RX 0
 #define EFCT_EVENT_TYPE_TX 1
 #define EFCT_EVENT_TYPE_CONTROL 3
-#define EFCT_EVENT_TYPE_CONTROL_LEGACY 2
 
 /* control events */
 #define EFCT_CTRL_SUBTYPE_LBN 53
@@ -162,8 +175,6 @@
 #define EFCT_TIME_SYNC_EVENT_CLOCK_IS_SET_LBN 49
 #define EFCT_TIME_SYNC_EVENT_CLOCK_IS_SET_WIDTH 1
 
-#define DP_PARTIAL_TSTAMP_SUB_NANO_BITS 2
-
 /* unsolicited credit definitions */
 
 #define EFCT_EVQ_UNSOL_CREDIT_REGISTER_OFFSET 0
@@ -179,20 +190,11 @@
 /* size of a transmit descriptor in bytes */
 #define EFCT_TX_DESCRIPTOR_BYTES 2
 
-/* size of the transmit FIFO in bytes */
-#define EFCT_TX_FIFO_BYTES 32768
-
-/* size of the transmit aperture in bytes */
-#define EFCT_TX_APERTURE 4096
-
 /* alignment requirement for tx packets written to the aperture */
 #define EFCT_TX_ALIGNMENT 64
 
 /* magic value of ct_thresh to disable cut-through */
 #define EFCT_TX_CT_DISABLE 0xff
-
-/* size of a receive header in bytes */
-#define EFCT_RX_HEADER_BYTES 16
 
 /* size of a transmit descriptor in bytes */
 #define EFCT_RX_DESCRIPTOR_BYTES 16

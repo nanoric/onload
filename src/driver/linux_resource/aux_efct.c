@@ -17,6 +17,7 @@
 #include <ci/driver/kernel_compat.h>
 #include <ci/driver/ci_efct.h>
 #include <ci/tools/bitfield.h>
+#include <kernel_utils/hugetlb.h>
 
 #include "efct_superbuf.h"
 
@@ -24,23 +25,19 @@
 
 /* EFCT TODO: enhance aux API to provide an extra cookie for this stuff so we
  * can get rid of this global variable filth */
-static DEFINE_MUTEX(memfd_provision_mtx);
-static struct file* memfd_provided = NULL;
-static off_t memfd_provided_off = -1;
+static DEFINE_MUTEX(efct_hugetlb_provision_mtx);
+static struct oo_hugetlb_allocator *efct_hugetlb_alloc = NULL;
 
-void efct_provide_bind_memfd(struct file* memfd, off_t memfd_off)
+void efct_provide_hugetlb_alloc(struct oo_hugetlb_allocator *hugetlb_alloc)
 {
-  mutex_lock(&memfd_provision_mtx);
-  memfd_provided = memfd;
-  memfd_provided_off = memfd_off;
+  mutex_lock(&efct_hugetlb_provision_mtx);
+  efct_hugetlb_alloc = hugetlb_alloc;
 }
 
-void efct_unprovide_bind_memfd(off_t *final_off)
+void efct_unprovide_hugetlb_alloc(void)
 {
-  if( final_off )
-    *final_off = memfd_provided_off;
-  memfd_provided = NULL;
-  mutex_unlock(&memfd_provision_mtx);
+  efct_hugetlb_alloc = NULL;
+  mutex_unlock(&efct_hugetlb_provision_mtx);
 }
 
 static bool seq_lt(uint32_t a, uint32_t b)
@@ -90,6 +87,10 @@ static int efct_handle_event(void *driver_data,
                              const struct xlnx_efct_event *event, int budget)
 {
   struct efhw_nic_efct *efct = (struct efhw_nic_efct *) driver_data;
+
+  /* Check we actually have a nic to act on before proceeding. */
+  if( ! efct->nic )
+    return 0;
 
   switch( event->type ) {
     case XLNX_EVENT_WAKEUP: {
@@ -181,113 +182,39 @@ int efct_request_wakeup(struct efhw_nic_efct *efct, struct efhw_efct_rxq *app,
   return -EAGAIN;
 }
 
-/* Allocating huge pages which are able to be mapped to userspace is a
- * nightmarish problem: the only thing that mmap() will accept is hugetlbfs
- * files, so we need to get ourselves one of them. And there's no single
- * way. */
-static struct file* efct_hugetlb_file_setup(off_t* off)
-{
-  if( memfd_provided ) {
-    get_file(memfd_provided);
-    *off = memfd_provided_off;
-    memfd_provided_off += CI_HUGEPAGE_SIZE;
-    return memfd_provided;
-  }
-
-#ifdef EFRM_HAVE_NEW_KALLSYMS
-  {
-    /* This fallback only exists on old kernels, but that's fine: new kernels
-     * all have memfd_create, and there's considerable overlap between 'old'
-     * and 'new' (e.g. RHEL8) so we can deal with potential oddballs */
-    static __typeof__(hugetlb_file_setup)* fn_hugetlb_file_setup;
-
-    if( ! fn_hugetlb_file_setup )
-      fn_hugetlb_file_setup = efrm_find_ksym("hugetlb_file_setup");
-
-    if( fn_hugetlb_file_setup ) {
-      struct user_struct* user;
-      *off = 0;
-      return fn_hugetlb_file_setup(HUGETLB_ANON_FILE, CI_HUGEPAGE_SIZE,
-                                   0, &user, HUGETLB_ANONHUGE_INODE,
-                                   ilog2(CI_HUGEPAGE_SIZE));
-    }
-  }
-#endif
-
-  EFHW_ERR("%s: ERROR: efct hugepages not possible on this kernel",
-            __func__);
-  return ERR_PTR(-EOPNOTSUPP);
-}
-
 static int efct_alloc_hugepage(void *driver_data,
                                struct xlnx_efct_hugepage *result_out)
 {
   /* The rx ring is owned by the net driver, not by us, so it does all
    * DMA handling. We do need to supply it with some memory, though. */
   struct xlnx_efct_hugepage result;
-  struct inode* inode;
-  struct address_space* mapping;
-  long rc;
-  off_t off;
+  int rc;
 
-  result.file = efct_hugetlb_file_setup(&off);
-  if( IS_ERR(result.file) ) {
-    rc = PTR_ERR(result.file);
-    EFHW_ERR("%s: ERROR: insufficient hugepage memory for rxq (%ld)",
-             __func__, rc);
+  if( ! efct_hugetlb_alloc ) {
+    EFHW_ERR("%s: ERROR: hugetlb allocator not supplied", __func__);
+    return -EINVAL;
+  }
+
+  rc = oo_hugetlb_page_alloc_raw(efct_hugetlb_alloc,
+                                 &result.file, &result.page);
+  if( rc ) {
+    if( rc != -EINTR )
+      EFHW_ERR("%s: ERROR: unable to allocate hugepage for rxq (%d)",
+               __func__, rc);
     return rc;
   }
 
-  inode = file_inode(result.file);
-  if( i_size_read(inode) < off + CI_HUGEPAGE_SIZE ) {
-    rc = vfs_truncate(&result.file->f_path, off + CI_HUGEPAGE_SIZE);
-    if( rc < 0 ) {
-      EFHW_ERR("%s: ERROR: ftruncate hugepage memory failed for rxq (%ld)",
-              __func__, rc);
-      goto fail;
-    }
-  }
-
-  rc = vfs_fallocate(result.file, 0, off, CI_HUGEPAGE_SIZE);
-  if( rc < 0 ) {
-    EFHW_ERR("%s: ERROR: fallocate hugepage memory failed for rxq (%ld)",
-             __func__, rc);
-    goto fail;
-  }
-
-  inode_lock(inode);
-  mapping = inode->i_mapping;
-  result.page = find_get_page(mapping, off / CI_HUGEPAGE_SIZE);
-  inode_unlock(inode);
-
-  if( ! result.page || ! PageHuge(result.page) || PageTail(result.page) ) {
-    /* memfd originated in userspace, so we have to check we actually got what
-     * we thought we would */
-    EFHW_ERR("%s: ERROR: rxq memfd was badly created (%ld / %d / %d)",
-             __func__, off, result.page ? PageHuge(result.page) : -1,
-             result.page ? PageTail(result.page) : -1);
-    rc = -EINVAL;
-    goto fail;
-  }
-
   *result_out = result;
-  return 0;
 
- fail:
-  if( memfd_provided )
-    memfd_provided_off -= CI_HUGEPAGE_SIZE;
-  fput(result.file);
-  return rc;
+  return 0;
 }
 
 static void efct_free_hugepage(void *driver_data,
                                struct xlnx_efct_hugepage *mem)
 {
-  /* EFCT TODO (minor): When we're using a memfd we could fallocate(PUNCH_HOLE)
-   * to free up the memory properly, in case the entire file isn't about to be
-   * freed */
-  put_page(mem->page);
-  fput(mem->file);
+  /* Almost certainly, we are called from the softirq context, e.g. with
+   * call_rcu(), so assume the "worst" and disallow non-atomic operations. */
+  oo_hugetlb_page_free_raw(mem->file, mem->page, /* atomic_context */ true);
 }
 
 static void efct_hugepage_list_changed(void *driver_data, int rxq)
@@ -354,19 +281,45 @@ static int efct_resource_init(struct xlnx_efct_device *edev,
   int i;
   int n_txqs;
 
+  rc = edev->ops->get_param(client, XLNX_EFCT_DESIGN_PARAM, &val);
+  if( rc < 0 )
+    return rc;
+
+  efct->hw_filters_n = val.design_params.num_filter;
+  efct->hw_filters = vzalloc(sizeof(*efct->hw_filters) * efct->hw_filters_n);
+  if( ! efct->hw_filters )
+    return -ENOMEM;
+
+  efct->rxq_n = val.design_params.rx_queues;
+  efct->rxq = vzalloc(sizeof(*efct->rxq) * efct->rxq_n);
+  if( ! efct->rxq )
+    return -ENOMEM;
+
+  efct->exclusive_rxq_mapping = vzalloc(sizeof(*efct->exclusive_rxq_mapping) * efct->rxq_n);
+  if( ! efct->exclusive_rxq_mapping )
+    return -ENOMEM;
+
+  for( i = 0; i < efct->rxq_n; ++i)
+    INIT_WORK(&efct->rxq[i].destruct_wq, efct_destruct_apps_work);
+
   rc = edev->ops->get_param(client, XLNX_EFCT_NIC_RESOURCES, &val);
   if( rc < 0 )
     return rc;
 
+  efct->evq_n = val.nic_res.evq_lim;
+  efct->evq = vzalloc(sizeof(*efct->evq) * efct->evq_n);
+  if( ! efct->evq )
+    return -ENOMEM;
+
   res_dim->vi_min = val.nic_res.evq_min;
-  res_dim->vi_lim = val.nic_res.evq_lim;
+  res_dim->vi_lim = CI_EFCT_EVQ_DUMMY_MAX;
   res_dim->mem_bar = VI_RES_MEM_BAR_UNDEFINED;
 
-  for( i = 0; i < CI_EFCT_MAX_EVQS; i++ )
+  for( i = 0; i < efct->evq_n; i++ )
     efct->evq[i].txq = EFCT_EVQ_NO_TXQ;
 
   n_txqs = val.nic_res.txq_lim - val.nic_res.txq_min;
-  for( i = 0; i < n_txqs && val.nic_res.evq_min + i < CI_EFCT_MAX_EVQS; i++ )
+  for( i = 0; i < n_txqs && val.nic_res.evq_min + i < val.nic_res.evq_lim; ++i )
     efct->evq[val.nic_res.evq_min + i].txq = val.nic_res.txq_min + i;
 
   rc = edev->ops->get_param(client, XLNX_EFCT_IRQ_RESOURCES, &val);
@@ -398,12 +351,11 @@ int efct_probe(struct auxiliary_device *auxdev,
   struct efhw_nic *nic;
   struct efhw_nic_efct *efct = NULL;
   int rc;
-  int i;
 
   EFRM_NOTICE("%s name %s version %#x", __func__, id->name, edev->version);
 
   if( edev->version >> 16 != XLNX_EFCT_AUX_VERSION >> 16 ) {
-    EFRM_ERR("%s: incompatible xilinx_efct driver: have %#x want %#x",
+    EFRM_ERR("%s: incompatible efct driver: have %#x want %#x",
              __func__, edev->version, XLNX_EFCT_AUX_VERSION);
     return -EPROTOTYPE;
   }
@@ -414,6 +366,14 @@ int efct_probe(struct auxiliary_device *auxdev,
 
   mutex_init(&efct->driver_filters_mtx);
   efct->edev = edev;
+
+  /* As soon as we've opened the handle we can start getting callbacks through
+   * our supplied efct_ops. Most of these will only occur once we've actually
+   * attached to an RXQ, however handle_event can start happening straight
+   * away. To avoid trying to use a device we will check in that function
+   * whether efct->nic is initted, which is our final step of init. This
+   * occurs with the rtnl lock held, which is also held for the suspend/resume
+   * ops which require us to use it. */
   client = edev->ops->open(auxdev, &efct_ops, efct);
   if( IS_ERR(client) ) {
     rc = PTR_ERR(client);
@@ -434,9 +394,6 @@ int efct_probe(struct auxiliary_device *auxdev,
     goto fail2;
   }
 
-  for( i = 0; i < CI_ARRAY_SIZE(efct->rxq); ++i)
-    INIT_WORK(&efct->rxq[i].destruct_wq, efct_destruct_apps_work);
-
   rc = efct_devtype_init(edev, client, &dev_type);
   if( rc < 0 )
     goto fail2;
@@ -455,6 +412,8 @@ int efct_probe(struct auxiliary_device *auxdev,
   nic->mtu = net_dev->mtu + ETH_HLEN;
   nic->arch_extra = efct;
   efct_nic_filter_init(efct);
+
+  /* Setting the nic here marks the device as ready for use. */
   efct->nic = nic;
 
   efrm_notify_nic_probe(net_dev);
@@ -466,6 +425,14 @@ int efct_probe(struct auxiliary_device *auxdev,
  fail2:
   edev->ops->close(client);
  fail1:
+  if( efct->hw_filters )
+    vfree(efct->hw_filters);
+  if( efct->rxq )
+    vfree(efct->rxq);
+  if( efct->evq )
+    vfree(efct->evq);
+  if( efct->exclusive_rxq_mapping )
+    vfree(efct->exclusive_rxq_mapping);
   vfree(efct);
   EFRM_ERR("%s rc %d", __func__, rc);
   return rc;
@@ -494,14 +461,19 @@ void efct_remove(struct auxiliary_device *auxdev)
     return;
 
   efct = nic->arch_extra;
-  for( i = 0; i < CI_ARRAY_SIZE(efct->rxq); ++i ) {
+  for( i = 0; i < efct->rxq_n; ++i ) {
     /* All workqueues should be already shut down by now, but it may happen
      * that the final efct_poll() did not happen.  Do it now. */
     efct_poll(efct, i, 0);
+  }
+  drain_workqueue(system_wq);
+
+  /* Now any destruct work items we queued as a result of the final poll have
+   * been drained, so everything should be gone. */
+  for( i = 0; i < efct->rxq_n; ++i ) {
     EFHW_ASSERT(efct->rxq[i].live_apps == NULL);
     EFHW_ASSERT(efct->rxq[i].new_apps == NULL);
   }
-  drain_workqueue(system_wq);
 
   rtnl_lock();
   net_dev = efhw_nic_get_net_dev(nic);
@@ -527,6 +499,10 @@ void efct_remove(struct auxiliary_device *auxdev)
    * TODO: rethink where to call close and how to synchronise with
    * the rest. */
   edev->ops->close(client);
+  vfree(efct->hw_filters);
+  vfree(efct->rxq);
+  vfree(efct->evq);
+  vfree(efct->exclusive_rxq_mapping);
   vfree(efct);
 }
 
@@ -539,7 +515,7 @@ MODULE_DEVICE_TABLE(auxiliary, efct_id_table);
 
 
 struct auxiliary_driver efct_drv = {
-  .name = "efct",
+  .name = "xilinx_efct",
   .probe = efct_probe,
   .remove = efct_remove,
   .id_table = efct_id_table,

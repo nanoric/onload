@@ -1,7 +1,9 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0 OR BSD-2-Clause
+# X-SPDX-Copyright-Text: (c) Copyright 2002-2023 Xilinx, Inc.
 ###############################################################################
 # <L5_PRIVATE L5_SCRIPT>
-#   Copyright: (c) Level 5 Networks Limited.
+#   Copyright: (c) Xilinx, Inc.
 #      Author: slp
 #     Started: 07/08/2002
 # Description: Script to load linux drivers and make device nodes.
@@ -25,6 +27,7 @@ CHAR_OPT=
 LOAD_CONFIG=false
 PROBE_CP_SERVER_PATH=true
 LINUX_NET="sfc"
+USER_NET="xilinx_efct"
 
 
 usage () {
@@ -76,7 +79,7 @@ usage () {
   err "  -allowload      - Ignore test failures during load"
   err "  -noselftest     - Don't do an offline self-test during load"
   err "  -nolro          - turn off Large Recieve Offload"
-  err "  -singlequeue   - use one RX queue only"
+  err "  -singlequeue    - use one RX queue only"
   err "  -netparm        - Add a module parameter setting for net driver"
   err "  -charparm       - Add a module parameter setting for char driver"
   err "  -suspend        - Suspend all interfaces by default"
@@ -243,7 +246,7 @@ get_interfaces() {
   declare -a interfaces
   for d in /sys/class/net/*; do
     driver="$(readlink "$d"/device/driver/module)"
-    for m in $LINUX_NET; do
+    for m in $LINUX_NET $USER_NET; do
         if [ "${driver%/"$m"}" != "$driver" ]; then
           interfaces[${#interfaces[*]}]="$(basename "$d")"
         fi

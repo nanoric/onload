@@ -101,6 +101,9 @@
 #define efhw_nic_handle_event(nic, ev, budget) \
 	((nic)->efhw_func->handle_event((nic), (ev), (budget)))
 
+#define efhw_nic_accept_vi_constraints(nic, low, order, arg) \
+	((nic)->efhw_func->accept_vi_constraints((nic), (low), (order), (arg)))
+
 /*-------------- DMA support  ------------ */
 #define efhw_nic_dmaq_tx_q_init(nic, client_id, params) \
 	((nic)->efhw_func->dmaq_tx_q_init((nic), (client_id), (params)))
@@ -190,23 +193,23 @@
 	((nic)->efhw_func->vi_set_user((nic), (vi_instance), (user)))
 
 /*-------------- filtering --------------------- */
-#define efhw_nic_rss_alloc(nic, indir, key, nic_rss_flags, num_qs, context) \
-        ((nic)->efhw_func->rss_alloc((nic), (indir), (key), (nic_rss_flags), \
+#define efhw_nic_rss_alloc(nic, indir, key, efhw_rss_mode, num_qs, context) \
+        ((nic)->efhw_func->rss_alloc((nic), (indir), (key), (efhw_rss_mode), \
 				     (num_qs), (context)))
-#define efhw_nic_rss_update(nic, indir, key, nic_rss_flags, rss_context) \
-	((nic)->efhw_func->rss_update((nic), (indir), (key), (nic_rss_flags), \
+#define efhw_nic_rss_update(nic, indir, key, efhw_rss_mode, rss_context) \
+	((nic)->efhw_func->rss_update((nic), (indir), (key), (efhw_rss_mode), \
 				      (rss_context)))
 #define efhw_nic_rss_free(nic, rss_context) \
 	((nic)->efhw_func->rss_free((nic), (rss_context)))
-#define efhw_nic_rss_flags(nic, flags_out) \
-	((nic)->efhw_func->rss_flags((nic), (flags_out)))
 
-#define efhw_nic_filter_insert(nic, spec, rxq, mask, flags) \
-	((nic)->efhw_func->filter_insert((nic), (spec), (rxq), (mask), (flags)))
+#define efhw_nic_filter_insert(nic, spec, rxq, exclusive_rxq_token, mask, flags) \
+	((nic)->efhw_func->filter_insert((nic), (spec), (rxq), (exclusive_rxq_token), (mask), (flags)))
 #define efhw_nic_filter_remove(nic, filter_id) \
 	((nic)->efhw_func->filter_remove((nic), (filter_id)))
 #define efhw_nic_filter_redirect(nic, filter_id, spec) \
 	((nic)->efhw_func->filter_redirect((nic), (filter_id), (spec)))
+#define efhw_nic_filter_query(nic, filter_id, info) \
+	((nic)->efhw_func->filter_query((nic), (filter_id), (info)))
 
 #define efhw_nic_multicast_block(nic, block) \
 	((nic)->efhw_func->multicast_block((nic), (block)))
@@ -229,3 +232,8 @@
 /*-------------- ctpio ------------------------ */
 #define efhw_nic_ctpio_addr(nic, instance, addr) \
 	((nic)->efhw_func->ctpio_addr((nic), (instance), (addr)))
+
+/*-------------- design parameters ------------ */
+#define efhw_nic_design_parameters(nic, dp) \
+	((nic)->efhw_func->design_parameters((nic), (dp)))
+

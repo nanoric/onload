@@ -1,4 +1,6 @@
 #!/bin/bash -u
+# SPDX-License-Identifier: BSD-2-Clause
+# X-SPDX-Copyright-Text: (c) Copyright 2007-2023 Xilinx, Inc.
 ##############################################################################
 # Copy only portions of source tree needed for onload, apply copyright
 # messages and pre-process to strip platforms we're not releasing.
@@ -138,7 +140,7 @@ try cd "$releasedir"
 
 # Copy lots of sources.
 docopy src/lib                citools ciul ciapp efhw efrm efthrm cplane
-docopy src/lib                onload_ext
+docopy src/lib                onload_ext kernel_utils
 docopy src/lib/transport      common ip unix
 docopy src/driver             linux linux_resource linux_char
 docopy src/driver             linux_onload
@@ -147,7 +149,7 @@ docopy src/tools/ip           sockbuf_filter.h
 docopy src/tools/ip           tcpdump_bin.c fuser.c
 docopy src/tools              jni onload_remote_monitor cplane onload_mibdump
 docopy src/tools              onload_helper
-docopy src/include            etherfabric onload cplane
+docopy src/include            etherfabric onload cplane kernel_utils
 docopy src/include/ci         compat compat.h tools tools.h app app.h
 docopy src/include/ci         driver efch efhw efrm internal net
 
@@ -174,6 +176,7 @@ fi
 docopy src/tests/onload       wire_order
 docopy src/tests/onload       extensions
 docopy src/tests/onload       hwtimestamping
+docopy src/tests/onload       startup
 
 docopy src/tests/onload/onload_remote_monitor       orm_example_client using_collectd
 

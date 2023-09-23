@@ -97,6 +97,7 @@ typedef uint64_t ef_addrspace;
 struct ef_vi;
 struct ef_filter_spec;
 struct ef_filter_cookie;
+struct efab_nic_design_parameters;
 
 /**********************************************************************
  * Dimensions *********************************************************
@@ -247,7 +248,8 @@ typedef union {
     unsigned       len        :16;
     unsigned       pkt_id     :32;
     unsigned       q_id       :8;
-    unsigned       user       :24;
+    unsigned       filter_id  :16;
+    unsigned       user       :8;
   } rx_ref;
   /** An event of type EF_EVENT_TYPE_RX_REF_DISCARD */
   struct {
@@ -255,7 +257,8 @@ typedef union {
     unsigned       len        :16;
     unsigned       pkt_id     :32;
     unsigned       q_id       :8;
-    unsigned       user       :24;
+    unsigned       filter_id  :16;
+    unsigned       user       :8;
     unsigned       flags      :16;
   } rx_ref_discard;
 } ef_event;
@@ -578,19 +581,11 @@ enum ef_vi_flags {
   EF_VI_RX_ZEROCOPY = 0x4000000,
   /** Support ef_vi_transmit_memcpy() (SN1000 series and newer). */
   EF_VI_ALLOW_MEMCPY = 0x8000000,
-  /** Disallow efct backward-compatibility emulation */
+  /** DEPRECATED FLAG */
   EF_VI_EFCT_UNIQUEUE = 0x10000000,
-  /** Require no shared traffic on the receive queue(s) of this application. */
-  /** Useful only for X3 series: other cards never use shared queues.
-   ** Exclusive queues have two effects:
-   **
-   ** -# Other applications cannot snoop on traffic filtered to this
-   **    application
-   ** -# This application can guarantee that it will not receive any packets
-   **    for which it did not explicitly add a filter */
+  /** DEPRECATED FLAG */
   EF_VI_RX_EXCLUSIVE = 0x20000000,
 };
-
 
 /*! \brief Flags that can be returned when an ef_vi has been allocated */
 enum ef_vi_out_flags {
@@ -601,6 +596,7 @@ enum ef_vi_out_flags {
 
 /*! \brief Flags that define which errors will cause either:
 ** - RX_DISCARD events; or
+** - EF_EVENT_TYPE_RX_REF_DISCARD; or
 ** - reporting of errors in EF_EVENT_TYPE_RX_MULTI_PKTS events.
 */
 enum ef_vi_rx_discard_err_flags {
@@ -612,14 +608,31 @@ enum ef_vi_rx_discard_err_flags {
   EF_VI_DISCARD_RX_ETH_FCS_ERR       = 0x4,
   /** Ethernet frame length error */
   EF_VI_DISCARD_RX_ETH_LEN_ERR       = 0x8,
-  /** To be discard in software (includes frame length error) */
-  EF_VI_DISCARD_RX_TOBE_DISC         = 0x10,     /* Siena only */
-  /* Inner TCP or UDP checksum error */
+  /** DEPRECATED FLAG */
+  EF_VI_DISCARD_RX_TOBE_DISC         = 0x10,
+  /** Inner TCP or UDP checksum error */
   EF_VI_DISCARD_RX_INNER_L4_CSUM_ERR = 0x20,
-  /* Inner IP checksum error */
-  EF_VI_DISCARD_RX_INNER_L3_CSUM_ERR = 0x40
-
-
+  /** Inner IP checksum error */
+  EF_VI_DISCARD_RX_INNER_L3_CSUM_ERR = 0x40,
+  /** Error flags ending with OTHER are only supported on NIC
+   ** architectures that support shared RXQs. Their purpose is 
+   ** for scenarios where the layer N header is corrupt and the packet
+   ** may not be successfully classed as that protocol, so may appear
+   ** as LN_other instead. In this case any layer N checksum validation
+   ** will not have been performed. By marking packets that are not the
+   ** expected protocol as discards the application can ensure that it
+   ** can distinguish correctly checksummed packets. For example,
+   ** if an application is expecting only TCP or UDP packets,
+   ** it can set EF_VI_DISCARD_RX_L4_CLASS_OTHER as part of the discard mask 
+   ** (along with the various _ERR discard types), and anything that didn't 
+   ** have its checksum validated, as it wasn't recognised as TCP or UDP, 
+   ** will be marked as a discard. */
+  /** Matches unrecognised ethernet frames or traffic containing more than 1 vlan tag. */
+  EF_VI_DISCARD_RX_L2_CLASS_OTHER    = 0x80,
+  /** Matches traffic that doesn't parse as IPv4 or IPv6. */
+  EF_VI_DISCARD_RX_L3_CLASS_OTHER    = 0x100,
+  /** Matches protocols other than TCP/UDP/fragmented traffic. */
+  EF_VI_DISCARD_RX_L4_CLASS_OTHER    = 0x200
 };
 
 
@@ -743,6 +756,10 @@ typedef struct {
   uint32_t         mask;
   /** Maximum space in the cut-through FIFO, reduced to account for header */
   uint32_t         ct_fifo_bytes;
+  /** EFCT header bytes that do not usually change between packets */
+  uint64_t         efct_fixed_header;
+  /** Mask to keep EFCT writes within the aperture */
+  uint32_t         efct_aperture_mask;
   /** Pointer to descriptors */
   void*            descriptors;
   /** Pointer to IDs */
@@ -912,7 +929,10 @@ typedef struct ef_vi {
   /** The timestamp correction (ns) for transmitted packets */
   int                           tx_ts_correction_ns;
   /** The timestamp format used by the hardware */
-  enum ef_timestamp_format      ts_format;
+  union {
+    enum ef_timestamp_format    ts_format;
+    uint8_t                     ts_subnano_bits;
+  };
   /** Pointer to virtual interface memory */
   char*                         vi_mem_mmap_ptr;
   /** Length of virtual interface memory */
@@ -995,6 +1015,9 @@ typedef struct ef_vi {
   int                         (*xdp_kick)(struct ef_vi*);
   void*                         xdp_kick_context;
 
+  /** mask to apply to unsol_credit_seq */
+  uint32_t                      unsol_credit_seq_mask;
+
   /*! \brief Driver-dependent operations. */
   /* Doxygen comment above is the detailed description of ef_vi::ops */
   struct ops {
@@ -1039,6 +1062,10 @@ typedef struct ef_vi {
     int (*transmit_alt_stop)(struct ef_vi*, unsigned alt_id);
     /** Transition a TX alternative to the GO state */
     int (*transmit_alt_go)(struct ef_vi*, unsigned alt_id);
+    /** Specify vi_discard behaviour */
+    int (*receive_set_discards)(struct ef_vi* vi, unsigned discard_err_flags);
+    /** Retrieve vi_discard behaviour */
+    uint64_t (*receive_get_discards)(struct ef_vi* vi);
     /** Transition a TX alternative to the DISCARD state */
     int (*transmit_alt_discard)(struct ef_vi*, unsigned alt_id);
     /** Initialize an RX descriptor on the RX descriptor ring */
@@ -1077,6 +1104,8 @@ typedef struct ef_vi {
   /** The difference between this and ops is purely documentational. Functions
    * here may be NULL if the driver doesn't need the feature. */
   struct internal_ops {
+    /** Configure based on hardware design parameters */
+    int (*design_parameters)(struct ef_vi*, struct efab_nic_design_parameters*);
     /** A filter has just been added to the given VI */
     int (*post_filter_add)(struct ef_vi*, const struct ef_filter_spec* fs,
                            const struct ef_filter_cookie* cookie, int rxq);
@@ -1525,11 +1554,23 @@ extern ef_request_id ef_vi_rxq_next_desc_id(ef_vi* vi);
 **
 ** \return 0 on success, or a negative error code.
 **
-** Set which errors cause an EF_EVENT_TYPE_RX_DISCARD event
+** Set which errors cause an EF_EVENT_TYPE_RX_DISCARD event. Not all flags
+** are supported on all NIC versions. To query which flags have been set
+** successfully use the ef_vi_receive_get_discards() function.
 */
-extern int
-ef_vi_receive_set_discards(ef_vi* vi, unsigned discard_err_flags);
+#define ef_vi_receive_set_discards(vi, discard_err_flags)          \
+  (vi)->ops.receive_set_discards((vi), discard_err_flags)
 
+/*! \brief Retrieve which errors cause an EF_EVENT_TYPE_RX_[REF_]DISCARD event
+**
+** \param vi                The virtual interface to query.
+**
+** \return mask of set ef_vi_rx_discard_err_flags
+**
+** Retrieve which errors cause an EF_EVENT_TYPE_RX_[REF_]DISCARD event
+*/
+#define ef_vi_receive_get_discards(vi)          \
+  (vi)->ops.receive_get_discards((vi))
 
 /**********************************************************************
  * Transmit interface *************************************************

@@ -98,6 +98,8 @@ static int cfg_fd_wait;
 static int cfg_max_fill = -1;
 static int cfg_exit_pkts = -1;
 static int cfg_register_mcast;
+static int cfg_discard = -1;
+static bool cfg_exclusive = false;
 
 /* Mutex to protect printing from different threads */
 static pthread_mutex_t printf_mutex;
@@ -361,6 +363,7 @@ static int poll_evq(struct resources* res)
       handle_rx_ref(res, evs[i].rx_ref.pkt_id, evs[i].rx_ref.len);
       break;
     case EF_EVENT_TYPE_RX_REF_DISCARD:
+      LOGE("ERROR: ref discard flags=%x\n", evs[i].rx_ref_discard.flags);
       handle_rx_ref(res, evs[i].rx_ref_discard.pkt_id,
                     evs[i].rx_ref_discard.len);
       break;
@@ -570,6 +573,9 @@ static __attribute__ ((__noreturn__)) void usage(void)
   fprintf(stderr, "  -F <fl>  set max fill level for RX ring\n");
   fprintf(stderr, "  -n <num> exit after receiving n packets\n");
   fprintf(stderr, "  -j       join multicast ipv4 address mentioned in filter-spec\n");
+  fprintf(stderr, "  -D <num> set specific discard mask. For specifics of possible discard masks,"
+                              "look at the enum defined for ef_vi_rx_discard_err_flags.\n");
+  fprintf(stderr, "  -x       require an exclusive RX queue\n");
   exit(1);
 }
 
@@ -583,7 +589,7 @@ int main(int argc, char* argv[])
   struct in_addr sa_mcast;
   int c, sock;
 
-  while( (c = getopt (argc, argv, "dtVL:vmbefF:n:j")) != -1 )
+  while( (c = getopt (argc, argv, "dtVL:vmbefF:n:jD:x")) != -1 )
     switch( c ) {
     case 'd':
       cfg_hexdump = 1;
@@ -620,6 +626,12 @@ int main(int argc, char* argv[])
       break;
     case 'j':
       cfg_register_mcast = 1;
+      break;
+    case 'D':
+      cfg_discard = strtol(optarg, NULL, 0);
+      break;
+    case 'x':
+      cfg_exclusive = true;
       break;
     case '?':
       usage();
@@ -661,6 +673,9 @@ int main(int argc, char* argv[])
   TRY(ef_vi_alloc_from_pd(&res->vi, res->dh, &res->pd, res->dh,
                           -1, cfg_max_fill, 0, NULL, -1, vi_flags));
 
+  if ( cfg_discard > -1 )
+    TRY(ef_vi_receive_set_discards(&res->vi, cfg_discard));
+
   res->rx_prefix_len = ef_vi_receive_prefix_len(&res->vi);
 
   if( cfg_rx_merge ) {
@@ -686,6 +701,7 @@ int main(int argc, char* argv[])
   LOGI("max_fill=%d\n", cfg_max_fill);
   LOGI("evq_size=%d\n", ef_eventq_capacity(&res->vi));
   LOGI("rx_prefix_len=%d\n", res->rx_prefix_len);
+  LOGI("discards=0x%"PRIx64"\n", ef_vi_receive_get_discards(&res->vi));
 
   /* Allocate memory for DMA transfers. Try mmap() with MAP_HUGETLB to get huge
    * pages. If that fails, fall back to posix_memalign() and hope that we do
@@ -728,7 +744,8 @@ int main(int argc, char* argv[])
   /* Add filters so that adapter will send packets to this VI. */
   while( argc > 0 ) {
     ef_filter_spec filter_spec;
-    if( filter_parse(&filter_spec, argv[0], &sa_mcast) != 0 ) {
+    if( filter_parse(&filter_spec, argv[0], &sa_mcast,
+                     cfg_exclusive ? EF_FILTER_FLAG_EXCLUSIVE_RXQ : EF_FILTER_FLAG_NONE) != 0 ) {
       LOGE("ERROR: Bad filter spec '%s'\n", argv[0]);
       exit(1);
     }

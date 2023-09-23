@@ -451,6 +451,7 @@ typedef struct {
 
 extern void ci_netif_config_opts_rangecheck(ci_netif_config_opts* opts) CI_HF;
 extern void ci_netif_config_opts_getenv(ci_netif_config_opts* opts) CI_HF;
+extern void ci_netif_config_opts_set_derived(ci_netif_config_opts* opts) CI_HF;
 extern void ci_netif_config_opts_defaults(ci_netif_config_opts* opts) CI_HF;
 #ifdef __KERNEL__
 extern void ci_netif_state_init(ci_netif* ni, int cpu_khz, 
@@ -515,8 +516,8 @@ ci_inline void ci_netif_send(ci_netif* ni, ci_ip_pkt_fmt* pkt)
 extern bool ci_netif_send_immediate(ci_netif* netif, ci_ip_pkt_fmt* pkt,
                                     const struct ef_vi_tx_extra* extra) CI_HF;
 extern int ci_netif_rx_post(ci_netif* netif, int nic_index, ef_vi* vi) CI_HF;
-#ifdef __KERNEL__
 extern int  ci_netif_set_rxq_limit(ci_netif*) CI_HF;
+#ifdef __KERNEL__
 extern int  ci_netif_init_fill_rx_rings(ci_netif*) CI_HF;
 #endif
 extern ci_uint64 ci_netif_purge_deferred_socket_list(ci_netif* ni) CI_HF;
@@ -4385,7 +4386,11 @@ ci_inline void ci_tcp_set_initialcwnd(ci_netif* ni, ci_tcp_state* ts) {
 
 /*! ?? \TODO should we use fackets to make things more exact ? */ 
 ci_inline unsigned ci_tcp_inflight(ci_tcp_state* ts)
-{ return SEQ_SUB(ts->snd_nxt, ts->snd_una);  }
+{
+  /* It is possible (e.g. during delegated sends) for snd_una to get ahead
+   * of snd_nxt. Return zero to avoid unsigned wrapping in that case. */
+  return CI_MAX(0, SEQ_SUB(ts->snd_nxt, ts->snd_una));
+}
 
 /* New value for [ssthresh] after loss (RFC2581 p5). */
 ci_inline unsigned ci_tcp_losswnd(ci_tcp_state* ts) {

@@ -5,7 +5,7 @@
 #include <linux/fs.h>
 #include <linux/device.h>
 #include <linux/cdev.h>
-#include "driver/linux_resource/autocompat.h"
+#include "ci/driver/kernel_compat.h"
 
 /* This file contains some simple utility functions for creating char
  * devices and their corresponding nodes in /dev, which are needed by most of
@@ -43,25 +43,18 @@ ci_inline void destroy_chrdev_and_mknod(struct ci_chrdev_registration* reg)
 }
 
 
+#ifdef EFRM_CLASS_DEVNODE_DEV_IS_CONST
+/* Linux >= 6.2 */
+ci_inline char* chrdev_devnode_set_mode(const struct device* dev,
+                                        umode_t* mode)
+#else
 ci_inline char* chrdev_devnode_set_mode(struct device* dev,
                                         umode_t* mode)
+#endif
 {
   if( mode )
     *mode = (umode_t)(uintptr_t)dev_get_drvdata(dev);
   return NULL;
-}
-
-
-ci_inline int chrdev_block_uevent(struct device* dev,
-                                  struct kobj_uevent_env* env)
-{
-  /* RHEL6 has a udevd which doesn't match the kernel, so the kernel can't pass
-   * configuration information about the /dev entry to udevd. This has the
-   * effect that if we create our /dev entry here with certain permissions
-   * then udevd will immediately wake up and overwrite it with 0660. By
-   * returning an error here we prevent the uevent from ever being sent. We
-   * didn't need udev to do anything anyway, on RHEL6 or any other distro. */
-  return -EINVAL;
 }
 
 
@@ -92,7 +85,7 @@ ci_inline int create_chrdev_and_mknod(int major, int minor, const char* name,
     goto fail_free;
   }
 
-  reg->class = class_create(THIS_MODULE, name);
+  reg->class = ci_class_create(name);
   if( IS_ERR(reg->class) ) {
     rc = PTR_ERR(reg->class);
     reg->class = NULL;
@@ -100,7 +93,6 @@ ci_inline int create_chrdev_and_mknod(int major, int minor, const char* name,
     goto fail_free;
   }
   reg->class->devnode = chrdev_devnode_set_mode;
-  reg->class->dev_uevent = chrdev_block_uevent;
 
   for( i = 0; i < count; ++i ) {
     dev_t devid = MKDEV(MAJOR(reg->devid), MINOR(reg->devid) + i);

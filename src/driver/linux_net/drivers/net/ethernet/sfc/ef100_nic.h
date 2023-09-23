@@ -80,12 +80,11 @@ enum {
 	EF100_STAT_COUNT
 };
 
+/* Keep this in sync with the contents of bar_config_name. */
 enum ef100_bar_config {
+	EF100_BAR_CONFIG_NONE,
 	EF100_BAR_CONFIG_EF100,
 	EF100_BAR_CONFIG_VDPA,
-#ifdef EFX_NOT_UPSTREAM
-	EF100_BAR_CONFIG_NONE,	/* For internal testing of the PROBED state */
-#endif
 };
 
 #if defined(EFX_USE_KCOMPAT) && !defined(EFX_HAVE_VDPA_MGMT_INTERFACE)
@@ -93,7 +92,6 @@ enum ef100_bar_config {
 enum ef100_vdpa_class {
 	EF100_VDPA_CLASS_NONE,
 	EF100_VDPA_CLASS_NET,
-	EF100_VDPA_CLASS_BLOCK,
 };
 #endif
 #endif
@@ -150,6 +148,7 @@ struct ef100_nic_data {
 	bool have_local_intf; /* local_mae_intf was populated successfully */
 	bool filters_up; /* filter table has been upped */
 	bool grp_mae; /* MAE Privilege */
+	bool vdpa_supported; /* true if vdpa is supported on this PCIe FN */
 #if defined(EFX_USE_KCOMPAT) && defined(EFX_TC_OFFLOAD) && \
     !defined(EFX_HAVE_FLOW_INDR_BLOCK_CB_REGISTER)
 	spinlock_t udp_tunnels_lock;
@@ -188,4 +187,7 @@ static inline bool efx_have_mport_journal_event(struct efx_nic *efx)
 	return efx_ef100_has_cap(nic_data->datapath_caps3,
 				 DYNAMIC_MPORT_JOURNAL);
 }
+
+int efx_ef100_set_bar_config(struct efx_nic *efx,
+			     enum ef100_bar_config new_config);
 #endif	/* EFX_EF100_NIC_H */

@@ -1312,6 +1312,11 @@ void efx_schedule_reset(struct efx_nic *efx, enum reset_type type)
 		if (!efx_net_active(READ_ONCE(efx->state)))
 			return;
 
+		/* Stop the periodic statistics monitor to prevent it firing
+		 * while we are handling the reset.
+		 */
+		efx_mac_stats_reset_monitor(efx);
+
 		/* we might be resetting because things are broken, so detach
 		 * so we don't get things like the TX watchdog firing while we
 		 * wait to reset.
@@ -1353,7 +1358,7 @@ void efx_fini_struct(struct efx_nic *efx)
 	kfree(efx->rps_hash_table);
 #endif
 
-#ifdef CONFIG_SFC_DEBUGFS
+#ifdef CONFIG_DEBUG_FS
 	mutex_destroy(&efx->debugfs_symlink_mutex);
 #endif
 }
@@ -1481,6 +1486,8 @@ int efx_init_struct(struct efx_nic *efx, struct pci_dev *pci_dev)
 	efx->num_mac_stats = MC_CMD_MAC_NSTATS;
 	BUILD_BUG_ON(MC_CMD_MAC_NSTATS - 1 != MC_CMD_MAC_GENERATION_END);
 	efx->stats_period_ms = STATS_PERIOD_MS_DEFAULT;
+	INIT_DELAYED_WORK(&efx->stats_monitor_work, efx_mac_stats_monitor);
+	efx->stats_monitor_generation = EFX_MC_STATS_GENERATION_INVALID;
 	efx->vi_stride = EFX_DEFAULT_VI_STRIDE;
 	mutex_init(&efx->mac_lock);
 	init_rwsem(&efx->filter_sem);
@@ -1495,7 +1502,7 @@ int efx_init_struct(struct efx_nic *efx, struct pci_dev *pci_dev)
 	INIT_WORK(&efx->mac_work, efx_mac_work);
 	init_waitqueue_head(&efx->flush_wq);
 
-#ifdef CONFIG_SFC_DEBUGFS
+#ifdef CONFIG_DEBUG_FS
 	mutex_init(&efx->debugfs_symlink_mutex);
 #endif
 	efx->tx_queues_per_channel = 1;
@@ -1631,7 +1638,7 @@ int efx_probe_common(struct efx_nic *efx)
 		return rc;
 
 	/* Create debugfs symlinks */
-#ifdef CONFIG_SFC_DEBUGFS
+#ifdef CONFIG_DEBUG_FS
 	mutex_lock(&efx->debugfs_symlink_mutex);
 	rc = efx_init_debugfs_nic(efx);
 	mutex_unlock(&efx->debugfs_symlink_mutex);
@@ -1644,7 +1651,7 @@ int efx_probe_common(struct efx_nic *efx)
 
 void efx_remove_common(struct efx_nic *efx)
 {
-#ifdef CONFIG_SFC_DEBUGFS
+#ifdef CONFIG_DEBUG_FS
 	mutex_lock(&efx->debugfs_symlink_mutex);
 	efx_fini_debugfs_nic(efx);
 	mutex_unlock(&efx->debugfs_symlink_mutex);
@@ -2430,7 +2437,7 @@ int __efx_dl_init_txq(struct efx_dl_device *efx_dev, u32 client_id,
 		      bool ctpio, bool ctpio_uthresh, bool m2m_d2c, u32 instance,
 		      u32 label, u32 target_evq, u32 num_entries)
 {
-	MCDI_DECLARE_PROXYABLE_BUF(inbuf, MC_CMD_INIT_TXQ_EXT_IN_LEN);
+	MCDI_DECLARE_BUF(inbuf, MC_CMD_INIT_TXQ_EXT_IN_LEN);
 	struct efx_nic *efx = efx_dl_device_priv(efx_dev);
 	struct efx_vport *vpx;
 	u32 port_id;
@@ -2493,7 +2500,7 @@ int __efx_dl_init_rxq(struct efx_dl_device *efx_dev, u32 client_id,
 		      u32 label, u32 target_evq, u32 num_entries,
 		      u8 ps_buf_size, bool force_rx_merge, int ef100_rx_buffer_size)
 {
-	MCDI_DECLARE_PROXYABLE_BUF(inbuf, MC_CMD_INIT_RXQ_V4_IN_LEN);
+	MCDI_DECLARE_BUF(inbuf, MC_CMD_INIT_RXQ_V4_IN_LEN);
 	struct efx_nic *efx = efx_dl_device_priv(efx_dev);
 	struct efx_vport *vpx;
 	u32 port_id;
@@ -2685,14 +2692,13 @@ static int __efx_dl_mcdi_rpc_client(struct efx_dl_device *efx_dev,
 static int __efx_dl_client_alloc(struct efx_dl_device *efx_dev, u32 parent,
                                  u32 *id)
 {
-	int rc;
-	MCDI_DECLARE_PROXYABLE_BUF(inbuf, MC_CMD_CLIENT_ALLOC_IN_LEN);
 	MCDI_DECLARE_BUF(outbuf, MC_CMD_CLIENT_ALLOC_OUT_LEN);
 	struct efx_nic *efx = efx_dl_device_priv(efx_dev);
+	int rc;
 
+	BUILD_BUG_ON(MC_CMD_CLIENT_ALLOC_IN_LEN != 0);
 	rc = efx_mcdi_rpc_client(efx, parent, MC_CMD_CLIENT_ALLOC,
-	                         inbuf, MC_CMD_CLIENT_ALLOC_IN_LEN,
-	                         outbuf, sizeof(outbuf), NULL);
+				 NULL, 0, outbuf, sizeof(outbuf), NULL);
 	if (rc)
 		return rc;
 	*id = MCDI_DWORD(outbuf, CLIENT_ALLOC_OUT_CLIENT_ID);

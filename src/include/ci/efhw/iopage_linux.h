@@ -108,14 +108,13 @@ static inline void efhw_page_init_from_va(struct efhw_page *p, void *va)
  *
  * struct efhw_iopages: A set of pages that are contiguous in the kernel
  * address space, may be mapped to user-level and may be DMA mapped.  Not
- * physically contiguous.
+ * necessarily physically contiguous.
  *
  *--------------------------------------------------------------------*/
 
 struct efhw_iopages {
 	void *ptr;
 	unsigned n_pages;
-	unsigned phys_cont;
 	/* For NICs which provide a pci_dev for DMA mapping these are the
 	 * DMA mapped (free_addrs) and translated (dma_addrs) page addresses
 	 * for this memory.
@@ -129,18 +128,6 @@ struct efhw_iopages {
 static inline caddr_t efhw_iopages_ptr(struct efhw_iopages *p)
 {
 	return p->ptr;
-}
-
-static inline unsigned efhw_iopages_pfn(struct efhw_iopages *p, int page_i)
-{
-	if (p->phys_cont) {
-		struct page *page = virt_to_page(p->ptr);
-		int order = compound_order(page);
-
-		return page_to_pfn(page) + (page_i & ((1 << order) - 1));
-	} else {
-		return vmalloc_to_pfn(p->ptr + (page_i << PAGE_SHIFT));
-	}
 }
 
 static inline dma_addr_t efhw_iopages_dma_addr(struct efhw_iopages *p,
@@ -195,6 +182,7 @@ efhw_page_map_add_lump(struct efhw_page_map* map, void* ptr, long n_pages)
 	return 0;
 }
 
+/* Pages passed to this function must be compatible with virt_to_page. */
 static inline int
 efhw_page_map_add_page(struct efhw_page_map* map, struct efhw_page* page)
 {
@@ -215,9 +203,11 @@ efhw_page_map_page(struct efhw_page_map* map, int page_i)
 	for (i = 0; i < map->n_lumps; ++i) {
 		struct efhw_page_map_lump* lump = &map->lumps[i];
 
-		if (page_i < lump->n_pages)
-			return virt_to_page((char*)lump->ptr + (page_i << PAGE_SHIFT));
-
+		if (page_i < lump->n_pages) {
+			void* addr = (char*)lump->ptr + (page_i << PAGE_SHIFT);
+			return is_vmalloc_addr(addr) ? vmalloc_to_page(addr) : virt_to_page(addr);
+		}
+			
 		page_i -= lump->n_pages;
 	}
 

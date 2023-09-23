@@ -10,8 +10,6 @@
 
 #ifndef EFX_DEBUGFS_H
 #define EFX_DEBUGFS_H
-
-#ifdef CONFIG_SFC_DEBUGFS
 #ifdef CONFIG_SFC_VDPA
 #include "ef100_vdpa.h"
 #endif
@@ -24,20 +22,21 @@ struct efx_debugfs_parameter {
 	int (*reader)(struct seq_file *, void *);
 };
 
-void efx_fini_debugfs_child(struct dentry *dir, const char *name);
+#ifdef CONFIG_DEBUG_FS
 int efx_init_debugfs_netdev(struct net_device *net_dev);
 void efx_fini_debugfs_netdev(struct net_device *net_dev);
+void efx_update_debugfs_netdev(struct efx_nic *efx);
 int efx_init_debugfs_nic(struct efx_nic *efx);
 void efx_fini_debugfs_nic(struct efx_nic *efx);
 int efx_init_debugfs_channels(struct efx_nic *efx);
 void efx_fini_debugfs_channels(struct efx_nic *efx);
-int efx_init_debugfs(const char *module);
+int efx_init_debugfs(void);
 void efx_fini_debugfs(void);
 int efx_extend_debugfs_port(struct efx_nic *efx,
 			    void *context, u64 ignore,
-			    struct efx_debugfs_parameter *params);
+			    const struct efx_debugfs_parameter *params);
 void efx_trim_debugfs_port(struct efx_nic *efx,
-			   struct efx_debugfs_parameter *params);
+			   const struct efx_debugfs_parameter *params);
 #ifdef CONFIG_SFC_VDPA
 int efx_init_debugfs_vdpa(struct ef100_vdpa_nic *vdpa);
 void efx_fini_debugfs_vdpa(struct ef100_vdpa_nic *vdpa);
@@ -54,7 +53,6 @@ int efx_debugfs_read_ulong(struct seq_file *, void *);
 int efx_debugfs_read_string(struct seq_file *, void *);
 int efx_debugfs_read_int(struct seq_file *, void *);
 int efx_debugfs_read_atomic(struct seq_file *, void *);
-int efx_debugfs_read_dword(struct seq_file *, void *);
 int efx_debugfs_read_u64(struct seq_file *, void *);
 int efx_debugfs_read_bool(struct seq_file *, void *);
 #ifdef CONFIG_SFC_VDPA
@@ -99,29 +97,6 @@ int efx_debugfs_read_x64(struct seq_file *, void *);
 	.reader = reader_function,					\
 }
 
-/* Likewise, but with one file for each of 4 lanes */
-#define EFX_PER_LANE_PARAMETER(prefix, suffix, container_type, parameter, \
-				field_type, reader_function) {		\
-	.name = prefix "0" suffix,					\
-	.offset = ((((field_type *) 0) ==				\
-		      ((container_type *) 0)->parameter) ?		\
-		    offsetof(container_type, parameter[0]) :		\
-		    offsetof(container_type, parameter[0])),		\
-	.reader = reader_function,					\
-},  {									\
-	.name = prefix "1" suffix,					\
-	.offset = offsetof(container_type, parameter[1]),		\
-	.reader = reader_function,					\
-}, {									\
-	.name = prefix "2" suffix,					\
-	.offset = offsetof(container_type, parameter[2]),		\
-	.reader = reader_function,					\
-}, {									\
-	.name = prefix "3" suffix,					\
-	.offset = offsetof(container_type, parameter[3]),		\
-	.reader = reader_function,					\
-}
-
 /* A string parameter (string embedded in the structure) */
 #define EFX_STRING_PARAMETER(container_type, parameter) {	\
 	.name = #parameter,					\
@@ -146,11 +121,6 @@ int efx_debugfs_read_x64(struct seq_file *, void *);
 #define EFX_ULONG_PARAMETER(container_type, parameter)		\
 	EFX_PARAMETER(container_type, parameter,		\
 		      unsigned long, efx_debugfs_read_ulong)
-
-/* A dword parameter */
-#define EFX_DWORD_PARAMETER(container_type, parameter)		\
-	EFX_PARAMETER(container_type, parameter,		\
-		      efx_dword_t, efx_debugfs_read_dword)
 
 /* A u64 parameter */
 #define EFX_U64_PARAMETER(container_type, parameter)		\
@@ -182,13 +152,16 @@ void efx_debugfs_print_filter(char *s, size_t l, struct efx_filter_spec *spec);
 int efx_debugfs_read_kernel_blocked(struct seq_file *file, void *data);
 #endif
 
-#else /* !CONFIG_SFC_DEBUGFS */
+#else /* !CONFIG_DEBUG_FS */
 
 static inline int efx_init_debugfs_netdev(struct net_device *net_dev)
 {
 	return 0;
 }
 static inline void efx_fini_debugfs_netdev(struct net_device *net_dev) {}
+
+static inline void efx_update_debugfs_netdev(struct efx_nic *efx) {}
+
 static inline int efx_init_debugfs_port(struct efx_nic *efx)
 {
 	return 0;
@@ -204,12 +177,49 @@ static inline int efx_init_debugfs_channels(struct efx_nic *efx)
 	return 0;
 }
 static inline void efx_fini_debugfs_channels(struct efx_nic *efx) {}
-static inline int efx_init_debugfs(const char *module)
+static inline int efx_init_debugfs(void)
 {
 	return 0;
 }
 static inline void efx_fini_debugfs(void) {}
 
-#endif /* CONFIG_SFC_DEBUGFS */
+static inline
+int efx_extend_debugfs_port(struct efx_nic *efx,
+			    void *context, u64 ignore,
+			    const struct efx_debugfs_parameter *params)
+{
+	return 0;
+}
+
+static inline
+void efx_trim_debugfs_port(struct efx_nic *efx,
+			   const struct efx_debugfs_parameter *params)
+{
+}
+
+#ifdef CONFIG_SFC_VDPA
+static inline int efx_init_debugfs_vdpa(struct ef100_vdpa_nic *vdpa)
+{
+	return 0;
+}
+
+static inline void efx_fini_debugfs_vdpa(struct ef100_vdpa_nic *vdpa)
+{
+}
+
+static inline
+int efx_init_debugfs_vdpa_vring(struct ef100_vdpa_nic *vdpa,
+				struct ef100_vdpa_vring_info *vdpa_vring,
+				u16 idx)
+{
+	return 0;
+}
+
+static inline
+void efx_fini_debugfs_vdpa_vring(struct ef100_vdpa_vring_info *vdpa_vring)
+{
+}
+#endif
+#endif /* CONFIG_DEBUG_FS */
 
 #endif /* EFX_DEBUGFS_H */

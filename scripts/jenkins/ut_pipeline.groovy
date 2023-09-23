@@ -113,7 +113,6 @@ void doDeveloperBuild(String build_profile=null) {
               utils.rake(["build:${component}"], defines: defines)
               deleteDir() // Delete the manually allocated workspace
             }
-            deleteDir() // Delete the workspace allocated implicitly by node
           }
         }
       }
@@ -220,7 +219,7 @@ void doUnitTestsPipeline() {
         echo("Profiles: ${build_profiles}")
 
         timeout(30) {
-          sh 'bundle install'
+          sh 'bundle check || bundle install'
         }
         def gcov = utils.rake(['build:which_gcov'], capture: true)
         gcovr_options = [

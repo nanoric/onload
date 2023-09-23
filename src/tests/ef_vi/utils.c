@@ -7,7 +7,6 @@
 #include <ci/app.h>
 
 #include <net/if.h>
-#include <assert.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -43,7 +42,8 @@ static int consume_parameter(char **arg)
 }
 
 
-int filter_parse(ef_filter_spec* fs, const char* s_in, struct in_addr *sa_mcast)
+int filter_parse(ef_filter_spec* fs, const char* s_in,
+                 struct in_addr *sa_mcast, enum ef_filter_flags flags)
 {
   union {
     struct sockaddr_storage ss;
@@ -59,7 +59,7 @@ int filter_parse(ef_filter_spec* fs, const char* s_in, struct in_addr *sa_mcast)
   int protocol;
   int i;
 
-  ef_filter_spec_init(fs, EF_FILTER_FLAG_NONE);
+  ef_filter_spec_init(fs, flags);
 
   s = strdup(s_in);
 
@@ -90,6 +90,8 @@ int filter_parse(ef_filter_spec* fs, const char* s_in, struct in_addr *sa_mcast)
     if( strchr(remainder, ',') ) {
       hostport = strtok(remainder, ",");
       remainder = strtok(NULL, "");
+      if( remainder == NULL )
+        goto out;
       TRY(ci_hostport_to_sockaddr(AF_UNSPEC, hostport, &laddr.ss));
       TRY(ci_hostport_to_sockaddr(laddr.ss.ss_family, remainder, &raddr.ss));
       if( laddr.ss.ss_family == AF_INET && raddr.ss.ss_family == AF_INET ) {
@@ -462,6 +464,32 @@ int my_getaddrinfo(const char* host, const char* port,
   hints.ai_canonname = NULL;
   hints.ai_next = NULL;
   return getaddrinfo(host, port, &hints, ai_out);
+}
+
+
+int parse_long(char* s, long min_val, long max_val, long* out)
+{
+  char *endptr;
+  long ret;
+
+  errno = 0;
+  ret = strtol(s, &endptr, 10);
+  if( errno != 0 ) {
+    return 0;
+  }
+
+  if( s == endptr ) {
+    errno = EINVAL;
+    return 0;
+  }
+
+  if( ret < min_val || ret > max_val ) {
+    errno = ERANGE;
+    return 0;
+  }
+
+  *out = ret;
+  return 1;
 }
 
 

@@ -27,6 +27,11 @@
 #include "ethtool_rxclass.h"
 #include "ethtool_flow.h"
 
+#define XDP_PROG_NAME "xdpsock"
+
+static char *bpf_link_helper = NULL;
+module_param(bpf_link_helper, charp, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(bpf_link_helper, "Path to the bpf-link-helper application");
 
 int enable_af_xdp_flow_filters = 1;
 module_param(enable_af_xdp_flow_filters, int, S_IRUGO | S_IWUSR);
@@ -146,6 +151,17 @@ struct event_waiter
   int budget;
 };
 
+/* Ring memory mapping artifacts */
+struct ring_map {
+  int n_pages;
+  struct page** pages;
+  void* vmapped_addr;
+};
+
+/* Are rings allocated as physically-continuous memory (linux<6.3) or
+ * via vmalloc (linux>=6.3)? */
+static bool rings_are_physically_continuous = true;
+
 /* Per-VI AF_XDP resources */
 struct efhw_af_xdp_vi
 {
@@ -158,6 +174,8 @@ struct efhw_af_xdp_vi
   struct efab_af_xdp_offsets kernel_offsets;
   struct efhw_page user_offsets_page;
   struct event_waiter waiter;
+
+  struct ring_map ring_mapping[4];
 };
 
 struct protection_domain
@@ -359,7 +377,7 @@ static int xdp_prog_load(struct sys_call_area* area, int map_fd)
   attr->insn_cnt = sizeof(const_prog) / sizeof(struct bpf_insn);
   attr->insns = sys_call_area_user_addr(area, prog);
   attr->license = sys_call_area_user_addr(area, license);
-  strncpy(attr->prog_name, "xdpsock", strlen("xdpsock"));
+  strncpy(attr->prog_name, XDP_PROG_NAME, strlen(XDP_PROG_NAME));
 
   return xdp_sys_bpf(BPF_PROG_LOAD, sys_call_area_user_addr(area, attr));
 }
@@ -437,19 +455,50 @@ static int xdp_bind(struct socket* sock, int ifindex, unsigned queue, unsigned f
 }
 
 /* Link an XDP program to an interface */
-static int xdp_set_link(struct net_device* dev, struct bpf_prog* prog)
+static int xdp_set_link(struct net_device* dev, int prog_fd)
 {
-  struct netdev_bpf bpf = {
-    .command = XDP_SETUP_PROG,
-    .prog = prog
-  };
+  if( dev->netdev_ops->ndo_bpf ) {
+    struct netdev_bpf bpf = {
+      .command = XDP_SETUP_PROG,
+      .prog = NULL,
+    };
 
-  if( !dev->netdev_ops->ndo_bpf ) {
-    EFHW_ERR("%s: %s does not support XDP", __FUNCTION__, dev->name);
-    return -ENOSYS;
+    if( prog_fd > 0 ) {
+      struct bpf_prog* prog = bpf_prog_get_type_dev(prog_fd, BPF_PROG_TYPE_XDP, 1);
+      ci_close_fd(prog_fd);
+      if( IS_ERR(prog) )
+        return PTR_ERR(prog);
+      bpf.prog = prog;
+    }
+
+    return dev->netdev_ops->ndo_bpf(dev, &bpf);
   }
+  else {
+    char *envp[] = { NULL };
+    char *argv[] = {
+      NULL,
+      dev->name,
+      prog_fd > 0 ? XDP_PROG_NAME : NULL,
+      NULL
+    };
 
-  return dev->netdev_ops->ndo_bpf(dev, &bpf);
+    EFHW_WARN("%s: %s does not support native XDP, using generic mode",
+              __FUNCTION__, dev->name);
+
+    if( bpf_link_helper ) {
+      argv[0] = strim(bpf_link_helper);
+    }
+    else {
+      EFHW_ERR("%s: bpf_link_helper parameter is not set. Failed to link.",
+               __FUNCTION__);
+      return -1;
+    }
+
+    EFHW_WARN("%s: spawning %s %s %s", __FUNCTION__,
+              argv[0], argv[1], argv[2] ? argv[2] : "");
+
+    return call_usermodehelper(argv[0], argv, envp, UMH_WAIT_EXEC);
+  }
 }
 
 /* Fault handler to provide buffer memory pages for our user mapping */
@@ -528,13 +577,14 @@ static int xdp_create_ring(struct socket* sock,
                            int capacity, int desc_size, int sockopt, long pgoff,
                            const struct xdp_ring_offset* xdp_offset,
                            struct efab_af_xdp_offsets_ring* kern_offset,
-                           struct efab_af_xdp_offsets_ring* user_offset)
+                           struct efab_af_xdp_offsets_ring* user_offset,
+                           struct ring_map* ring_mapping)
 {
   int rc;
-  unsigned long map_size, addr, pfn, pages;
+  unsigned long map_size, addr, pfn, pages = 0;
   int64_t user_base, kern_base;
   struct vm_area_struct* vma;
-  void* ring_base;
+  void* ring_base = kern_mem_base;
 
   user_base = page_map->n_pages << PAGE_SHIFT;
 
@@ -556,15 +606,43 @@ static int xdp_create_ring(struct socket* sock,
     rc = -EFAULT;
   }
   else {
-    rc = follow_pfn(vma, addr, &pfn);
+    if( rings_are_physically_continuous )
+      rc = follow_pfn(vma, addr, &pfn);
     pages = (vma->vm_end - vma->vm_start) >> PAGE_SHIFT;
   }
   mmap_write_unlock(current->mm);
 
-  if( rc >= 0 ) {
-    ring_base = phys_to_virt(pfn << PAGE_SHIFT);
-    rc = efhw_page_map_add_lump(page_map, ring_base, pages);
+  if( ! rings_are_physically_continuous || rc == -EINVAL ) {
+    /* Probably the rings were vmalloc'ed, as in linux>=6.3 */
+
+    ring_mapping->pages = kzalloc(sizeof(struct page *) * pages, GFP_KERNEL);
+    if( ring_mapping->pages == NULL ) {
+      rc = -ENOMEM;
+    }
+    else {
+      mmap_read_lock(current->mm);
+      rc = pin_user_pages(addr, pages, FOLL_WRITE, ring_mapping->pages, NULL);
+      mmap_read_unlock(current->mm);
+
+      if( rc == pages )
+        ring_mapping->vmapped_addr = vmap(ring_mapping->pages,
+                                          pages, VM_MAP, PAGE_KERNEL);
+      else if( rc >= 0 )
+        rc = -EFAULT;
+    }
+
+    if( rc > 0 ) {
+      ring_mapping->n_pages = pages;
+      ring_base = ring_mapping->vmapped_addr;
+      if( rings_are_physically_continuous )
+        rings_are_physically_continuous = false;
+    }
   }
+  else if( rc >= 0 ) {
+    ring_base = phys_to_virt(pfn << PAGE_SHIFT);
+  }
+  if( rc >= 0 )
+    rc = efhw_page_map_add_lump(page_map, ring_base, pages);
 
   vm_munmap(addr, map_size);
 
@@ -587,7 +665,8 @@ static int xdp_create_rings(struct socket* sock,
                             struct efhw_page_map* page_map, void* kern_mem_base,
                             long rxq_capacity, long txq_capacity,
                             struct efab_af_xdp_offsets_rings* kern_offsets,
-                            struct efab_af_xdp_offsets_rings* user_offsets)
+                            struct efab_af_xdp_offsets_rings* user_offsets,
+                            struct ring_map* ring_mapping)
 {
   int rc;
   struct sys_call_area rw_area;
@@ -632,28 +711,32 @@ static int xdp_create_rings(struct socket* sock,
   rc = xdp_create_ring(sock, page_map, kern_mem_base,
                        rxq_capacity, sizeof(struct xdp_desc),
                        XDP_RX_RING, XDP_PGOFF_RX_RING,
-                       &mmap_offsets->rx, &kern_offsets->rx, &user_offsets->rx);
+                       &mmap_offsets->rx, &kern_offsets->rx, &user_offsets->rx,
+                       ring_mapping++);
   if( rc < 0 )
     goto out;
 
   rc = xdp_create_ring(sock, page_map, kern_mem_base,
                        txq_capacity, sizeof(struct xdp_desc),
                        XDP_TX_RING, XDP_PGOFF_TX_RING,
-                       &mmap_offsets->tx, &kern_offsets->tx, &user_offsets->tx);
+                       &mmap_offsets->tx, &kern_offsets->tx, &user_offsets->tx,
+                       ring_mapping++);
   if( rc < 0 )
     goto out;
 
   rc = xdp_create_ring(sock, page_map, kern_mem_base,
                        rxq_capacity, sizeof(uint64_t),
                        XDP_UMEM_FILL_RING, XDP_UMEM_PGOFF_FILL_RING,
-                       &mmap_offsets->fr, &kern_offsets->fr, &user_offsets->fr);
+                       &mmap_offsets->fr, &kern_offsets->fr, &user_offsets->fr,
+                       ring_mapping++);
   if( rc < 0 )
     goto out;
 
   rc = xdp_create_ring(sock, page_map, kern_mem_base,
                        txq_capacity, sizeof(uint64_t),
                        XDP_UMEM_COMPLETION_RING, XDP_UMEM_PGOFF_COMPLETION_RING,
-                       &mmap_offsets->cr, &kern_offsets->cr, &user_offsets->cr);
+                       &mmap_offsets->cr, &kern_offsets->cr, &user_offsets->cr,
+                       ring_mapping);
   if( rc < 0 )
     goto out;
 
@@ -677,6 +760,8 @@ static void xdp_release_pd(struct efhw_nic* nic, int owner)
 
 static void xdp_release_vi(struct efhw_nic* nic, struct efhw_af_xdp_vi* vi)
 {
+  int i;
+
   if( !vi->sock )
     /* We expect uninitialized vi in cases where af_xdp_init()
      * has not been called after enabling evq.
@@ -703,6 +788,14 @@ static void xdp_release_vi(struct efhw_nic* nic, struct efhw_af_xdp_vi* vi)
 
   /* Release the resources attached to the socket */
   efhw_page_free(&vi->user_offsets_page);
+
+  for( i = 0; i < CI_ARRAY_SIZE(vi->ring_mapping); i++ ) {
+    if( vi->ring_mapping[i].n_pages > 0 ) {
+      vunmap(vi->ring_mapping[i].vmapped_addr);
+      unpin_user_pages(vi->ring_mapping[i].pages, vi->ring_mapping[i].n_pages);
+    }
+  }
+
   memset(vi, 0, sizeof(*vi));
 }
 
@@ -763,26 +856,27 @@ static int af_xdp_init(struct efhw_nic* nic, int instance,
 
   rc = efhw_page_alloc_zeroed(&vi->user_offsets_page);
   if( rc < 0 )
-    goto out_free_sock;
+    goto fail;
   user_offsets = (void*)efhw_page_ptr(&vi->user_offsets_page);
 
   rc = efhw_page_map_add_page(page_map, &vi->user_offsets_page);
   if( rc < 0 )
-    goto out_free_user_offsets;
+    goto fail;
 
   rc = xdp_register_umem(sock, &pd->umem, chunk_size, headroom);
   if( rc < 0 )
-    goto out_free_user_offsets;
+    goto fail;
 
   rc = xdp_create_rings(sock, page_map, &vi->kernel_offsets,
                         vi->rxq_capacity, vi->txq_capacity,
-                        &vi->kernel_offsets.rings, &user_offsets->rings);
+                        &vi->kernel_offsets.rings, &user_offsets->rings,
+                        vi->ring_mapping);
   if( rc < 0 )
-    goto out_free_user_offsets;
+    goto fail;
 
   rc = xdp_map_update(nic->arch_extra, instance, file);
   if( rc < 0 )
-    goto out_free_user_offsets;
+    goto fail;
 
   /* TODO AF_XDP: currently instance number matches net_device channel */
   rc = xdp_bind(sock, nic->net_dev->ifindex, instance, vi->flags);
@@ -799,7 +893,7 @@ static int af_xdp_init(struct efhw_nic* nic, int instance,
     rc = xdp_bind(sock, nic->net_dev->ifindex, instance, vi->flags);
   }
   if( rc < 0 )
-    goto xdp_bind_failed;
+    goto fail;
 
   if( vi->waiter.wait.func != NULL )
     add_wait_queue(sk_sleep(vi->sock->sk), &vi->waiter.wait);
@@ -807,12 +901,9 @@ static int af_xdp_init(struct efhw_nic* nic, int instance,
   user_offsets->mmap_bytes = efhw_page_map_bytes(page_map);
   return 0;
 
- xdp_bind_failed:
- out_free_user_offsets:
-  efhw_page_free(&vi->user_offsets_page);
- out_free_sock:
-  fput(file);
-  memset(vi, 0, sizeof(*vi));
+ fail:
+  vi->waiter.wait.func = NULL;
+  xdp_release_vi(nic, vi);
   return rc;
 }
 
@@ -876,6 +967,39 @@ af_xdp_nic_v3_license_challenge(struct efhw_nic *nic,
 	return 0;
 }
 
+/* Update the efhw_nic struct with the nic's supported RSS hash key length
+ * and indirection table length. */
+static int
+af_xdp_rss_get_support(struct efhw_nic *nic)
+{
+	struct net_device *dev = nic->net_dev;
+	int rc = 0;
+	const struct ethtool_ops *ops;
+
+	ASSERT_RTNL();
+
+	ops = dev->ethtool_ops;
+	if (!ops->get_rxfh_indir_size) {
+		EFHW_WARN("%s: %s does not support `get_rxfh_indir_size` operation",
+							__FUNCTION__, dev->name);
+		rc = -EOPNOTSUPP;
+		goto unlock_out;
+	}
+
+	nic->rss_indir_size = ops->get_rxfh_indir_size(dev);
+
+	if (!ops->get_rxfh_key_size) {
+		EFHW_WARN("%s: %s does not support `get_rxfh_key_size` operation",
+							__FUNCTION__, dev->name);
+		rc = -EOPNOTSUPP;
+		goto unlock_out;
+	}
+
+	nic->rss_key_size = ops->get_rxfh_key_size(dev);
+
+unlock_out:
+	return rc;
+}
 
 static void
 af_xdp_nic_tweak_hardware(struct efhw_nic *nic)
@@ -903,7 +1027,6 @@ __af_xdp_nic_init_hardware(struct efhw_nic *nic,
 			   struct sys_call_area* sys_call_area)
 {
 	int map_fd, rc;
-	struct bpf_prog* prog;
 	struct efhw_nic_af_xdp* xdp;
 
 	xdp = kzalloc(sizeof(*xdp) +
@@ -925,14 +1048,7 @@ __af_xdp_nic_init_hardware(struct efhw_nic *nic,
 	if( rc < 0 )
 		goto fail;
 
-	prog = bpf_prog_get_type_dev(rc, BPF_PROG_TYPE_XDP, 1);
-	ci_close_fd(rc);
-	if( IS_ERR(prog) ) {
-		rc = PTR_ERR(prog);
-		goto fail;
-	}
-
-	rc = xdp_set_link(nic->net_dev, prog);
+	rc = xdp_set_link(nic->net_dev, rc);
 	if( rc < 0 )
 		goto fail;
 
@@ -943,7 +1059,9 @@ __af_xdp_nic_init_hardware(struct efhw_nic *nic,
 	memcpy(nic->mac_addr, mac_addr, ETH_ALEN);
 
 	af_xdp_nic_tweak_hardware(nic);
-	return 0;
+
+	rc = af_xdp_rss_get_support(nic);
+	return rc;
 
 fail:
 	ci_close_fd(map_fd);
@@ -974,7 +1092,7 @@ static void
 af_xdp_nic_release_hardware(struct efhw_nic* nic)
 {
   struct efhw_nic_af_xdp* xdp = nic->arch_extra;
-  xdp_set_link(nic->net_dev, NULL);
+  xdp_set_link(nic->net_dev, -1);
   if( xdp ) {
     fput(xdp->map);
     kfree(xdp);
@@ -1039,6 +1157,17 @@ af_xdp_nic_wakeup_request(struct efhw_nic *nic, volatile void __iomem* io_page,
 static void af_xdp_nic_sw_event(struct efhw_nic *nic, int data, int evq)
 {
 	EFHW_ERR("%s: FIXME AF_XDP", __FUNCTION__);
+}
+
+static bool af_xdp_accept_vi_constraints(struct efhw_nic *nic, int low,
+					 unsigned order, void* arg)
+{
+	struct efhw_vi_constraints *avc = arg;
+
+	if( avc->channel >= 0 )
+		return avc->channel == low;
+
+	return true;
 }
 
 /*--------------------------------------------------------------------
@@ -1119,6 +1248,12 @@ af_xdp_dmaq_rx_q_init(struct efhw_nic *nic, uint32_t client_id,
   return 0;
 }
 
+static int
+af_xdp_design_parameters(struct efhw_nic *nic,
+                         struct efab_nic_design_parameters *dp)
+{
+  return 0;
+}
 
 static size_t af_xdp_max_shared_rxqs(struct efhw_nic *nic)
 {
@@ -1356,14 +1491,54 @@ af_xdp_vi_set_user(struct efhw_nic *nic, uint32_t vi_instance, uint32_t user)
  *--------------------------------------------------------------------*/
 static int
 af_xdp_rss_alloc(struct efhw_nic *nic, const u32 *indir, const u8 *key,
-		 u32 nic_rss_flags, int num_qs, u32 *rss_context_out)
+		 u32 efhw_rss_mode, int num_qs, u32 *rss_context_out)
 {
-	return -ENOSYS;
+	struct net_device *dev = nic->net_dev;
+	int rc = 0;
+	const struct ethtool_ops *ops;
+
+	EFHW_ASSERT(efhw_rss_mode == EFHW_RSS_MODE_DEFAULT);
+
+	/* We enter the function with rtnl held */
+	ASSERT_RTNL();
+
+	/* TODO AF_XDP: Establish whether the RSS hash key can be expanded or
+	* contracted while still maintaining favourable properties.
+	* For now error out if the NIC has the wrong value.
+	*/
+	if (nic->rss_key_size != EFRM_RSS_KEY_LEN) {
+		EFHW_ERR("%s: ERROR: Onload does not support this device's RSS hash key size.\n"
+				"Expecting hash key size of %u, %s's current size = %u",
+				__FUNCTION__, EFRM_RSS_KEY_LEN, dev->name, nic->rss_key_size);
+		rc = -ENOSYS;
+		goto unlock_out;
+	}
+
+	ops = dev->ethtool_ops;
+	if (!ops->set_rxfh_context) {
+		EFHW_WARN("%s: %s does not support `set_rxfh_context` operation",
+							__FUNCTION__, dev->name);
+		rc = -EOPNOTSUPP;
+		goto unlock_out;
+	}
+
+	/* We want to allocate a context */
+	*rss_context_out = ETH_RXFH_CONTEXT_ALLOC;
+
+	/* TODO AF_XDP: We want to check that this device can use a toeplitz hash */
+	rc = ops->set_rxfh_context(dev, indir, key, /*hfunc*/ 0, rss_context_out, false);
+
+	if( rc < 0 ) {
+		EFHW_WARN("%s: rc = %d", __FUNCTION__, rc);
+	}
+
+unlock_out:
+	return rc;
 }
 
 static int
 af_xdp_rss_update(struct efhw_nic *nic, const u32 *indir, const u8 *key,
-		  u32 nic_rss_flags, u32 rss_context)
+		  u32 efhw_rss_mode, u32 rss_context)
 {
 	return -ENOSYS;
 }
@@ -1371,13 +1546,29 @@ af_xdp_rss_update(struct efhw_nic *nic, const u32 *indir, const u8 *key,
 static int
 af_xdp_rss_free(struct efhw_nic *nic, u32 rss_context)
 {
-	return -ENOSYS;
-}
+	struct net_device *dev = nic->net_dev;
+	int rc = 0;
+	const struct ethtool_ops *ops;
 
-static int
-af_xdp_rss_flags(struct efhw_nic *nic, u32 *flags_out)
-{
-	return -ENOSYS;
+	rtnl_lock();
+
+	ops = dev->ethtool_ops;
+	if (!ops->set_rxfh_context) {
+		EFHW_WARN("%s: %s does not support `set_rxfh_context` operation",
+							__FUNCTION__, dev->name);
+		rc = -EOPNOTSUPP;
+		goto unlock_out;
+	}
+
+	rc = ops->set_rxfh_context(dev, NULL, NULL, 0, &rss_context, true);
+
+	if (rc < 0) {
+		EFHW_WARN("%s: rc = %d", __FUNCTION__, rc);
+	}
+
+unlock_out:
+	rtnl_unlock();
+	return rc;
 }
 
 static int af_xdp_efx_spec_to_ethtool_flow(struct efx_filter_spec* efx_spec,
@@ -1408,7 +1599,10 @@ static int af_xdp_efx_spec_to_ethtool_flow(struct efx_filter_spec* efx_spec,
 	if (rc < 0)
 		return rc;
 
-	switch (fs->flow_type) {
+	/* FLOW_RSS is not mutually exclusive with the other flow_type options
+	* so temporarily ignore it.
+	*/
+	switch (fs->flow_type & ~(FLOW_RSS)) {
 	case UDP_V4_FLOW:
 		if (fs->m_u.udp_ip4_spec.tos)
 			return -EOPNOTSUPP;
@@ -1441,7 +1635,8 @@ static int af_xdp_efx_spec_to_ethtool_flow(struct efx_filter_spec* efx_spec,
 
 static int
 af_xdp_filter_insert(struct efhw_nic *nic, struct efx_filter_spec *spec,
-		     int *rxq, const struct cpumask *mask, unsigned flags)
+                     int *rxq, unsigned pd_excl_token, const struct cpumask *mask,
+                     unsigned flags)
 {
 	struct net_device *dev = nic->net_dev;
 	int rc;
@@ -1456,6 +1651,9 @@ af_xdp_filter_insert(struct efhw_nic *nic, struct efx_filter_spec *spec,
 	rc = af_xdp_efx_spec_to_ethtool_flow(spec, &info.fs);
 	if ( rc < 0 )
 		return rc;
+
+	if (info.fs.flow_type & FLOW_RSS)
+		info.rss_context = spec->rss_context;
 
 	rtnl_lock();
 
@@ -1509,6 +1707,14 @@ af_xdp_filter_redirect(struct efhw_nic *nic, int filter_id,
 	 * looking in there. */
 	return -ENODEV;
 }
+
+static int
+af_xdp_filter_query(struct efhw_nic *nic, int filter_id,
+                    struct efhw_filter_info *info)
+{
+  return -EOPNOTSUPP;
+}
+
 
 static int
 af_xdp_multicast_block(struct efhw_nic *nic, bool block)
@@ -1591,6 +1797,7 @@ struct efhw_func_ops af_xdp_char_functional_units = {
 	af_xdp_nic_wakeup_request,
 	af_xdp_nic_sw_event,
 	af_xdp_handle_event,
+	af_xdp_accept_vi_constraints,
 	af_xdp_dmaq_tx_q_init,
 	af_xdp_dmaq_rx_q_init,
 	af_xdp_flush_tx_dma_channel,
@@ -1619,10 +1826,10 @@ struct efhw_func_ops af_xdp_char_functional_units = {
 	af_xdp_rss_alloc,
 	af_xdp_rss_update,
 	af_xdp_rss_free,
-	af_xdp_rss_flags,
 	af_xdp_filter_insert,
 	af_xdp_filter_remove,
 	af_xdp_filter_redirect,
+	af_xdp_filter_query,
 	af_xdp_multicast_block,
 	af_xdp_unicast_block,
 	af_xdp_vport_alloc,
@@ -1634,6 +1841,7 @@ struct efhw_func_ops af_xdp_char_functional_units = {
 	af_xdp_vi_io_region,
 	af_xdp_inject_reset_ev,
 	af_xdp_ctpio_addr,
+	af_xdp_design_parameters,
 	af_xdp_max_shared_rxqs,
 };
 

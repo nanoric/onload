@@ -259,14 +259,19 @@ int ef_filter_spec_set_eth_type(ef_filter_spec *fs, uint16_t ether_type_be16)
 
 int ef_filter_spec_set_dest(ef_filter_spec* fs, int dest, unsigned flags)
 {
-  if (flags)
-    return -EINVAL;
   if (fs->type & (EF_FILTER_PORT_SNIFF | EF_FILTER_TX_PORT_SNIFF |
                   EF_FILTER_BLOCK_KERNEL | EF_FILTER_BLOCK_KERNEL_MULTICAST |
                   EF_FILTER_BLOCK_KERNEL_UNICAST))
     return -EPROTONOSUPPORT;
-  fs->type |= EF_FILTER_HAS_DEST;
+
+  if ( dest < 0 || dest > 0xffff )
+    return -EINVAL;
+
+  if ( (fs->flags & EF_FILTER_FLAG_EXCLUSIVE_RXQ) && ( dest == 0) )
+    return -EINVAL;
+  
   fs->data[0] = (fs->data[0] & 0xffff) | (dest << 16);
+  fs->type |= EF_FILTER_HAS_DEST;
   return 0;
 }
 
@@ -277,7 +282,7 @@ int ef_filter_spec_set_dest(ef_filter_spec* fs, int dest, unsigned flags)
  */
 
 static int ef_filter_add_special(ef_driver_handle dh, int resource_id,
-                                 int pref_rxq_no, int type,
+                                 int pref_rxq_no, unsigned flags, int type,
                                  bool promisc, uint16_t vlan_id,
                                  ef_filter_cookie *filter_cookie_out, int *rxq_out)
 {
@@ -298,32 +303,41 @@ static int ef_filter_add_special(ef_driver_handle dh, int resource_id,
     break;
   case EF_FILTER_BLOCK_KERNEL:
     op.op = CI_RSOP_FILTER_ADD_BLOCK_KERNEL;
+    op.u.filter_add.u.in.flags = flags;
     break;
   case EF_FILTER_BLOCK_KERNEL_UNICAST:
     op.op = CI_RSOP_FILTER_ADD_BLOCK_KERNEL_UNICAST;
+    op.u.filter_add.u.in.flags = flags;
     break;
   case EF_FILTER_BLOCK_KERNEL_MULTICAST:
     op.op = CI_RSOP_FILTER_ADD_BLOCK_KERNEL_MULTICAST;
+    op.u.filter_add.u.in.flags = flags;
     break;
   case EF_FILTER_ALL_UNICAST:
     op.op = CI_RSOP_FILTER_ADD_ALL_UNICAST;
+    op.u.filter_add.u.in.flags = flags;
     break;
   case EF_FILTER_ALL_MULTICAST:
     op.op = CI_RSOP_FILTER_ADD_ALL_MULTICAST;
+    op.u.filter_add.u.in.flags = flags;
     break;
   case EF_FILTER_MISMATCH_UNICAST | EF_FILTER_VLAN:
     op.op = CI_RSOP_FILTER_ADD_MISMATCH_UNICAST_VLAN;
     op.u.filter_add.mac.vlan_id = vlan_id;
+    op.u.filter_add.u.in.flags = flags;
     break;
   case EF_FILTER_MISMATCH_UNICAST:
     op.op = CI_RSOP_FILTER_ADD_MISMATCH_UNICAST;
+    op.u.filter_add.u.in.flags = flags;
     break;
   case EF_FILTER_MISMATCH_MULTICAST | EF_FILTER_VLAN:
     op.op = CI_RSOP_FILTER_ADD_MISMATCH_MULTICAST_VLAN;
     op.u.filter_add.mac.vlan_id = vlan_id;
+    op.u.filter_add.u.in.flags = flags;
     break;
   case EF_FILTER_MISMATCH_MULTICAST:
     op.op = CI_RSOP_FILTER_ADD_MISMATCH_MULTICAST;
+    op.u.filter_add.u.in.flags = flags;
     break;
   default:
     return -EINVAL;
@@ -473,7 +487,7 @@ static int ef_filter_add(ef_driver_handle dh, int resource_id, int rxq_no,
     case EF_FILTER_MISMATCH_UNICAST:
     case EF_FILTER_MISMATCH_MULTICAST | EF_FILTER_VLAN:
     case EF_FILTER_MISMATCH_MULTICAST:
-      return ef_filter_add_special(dh, resource_id, rxq_no, fs->type,
+      return ef_filter_add_special(dh, resource_id, rxq_no, flags, fs->type,
                                    get_proto(fs), fs->data[5],
                                    filter_cookie_out, rxq_out);
     default:
@@ -516,20 +530,26 @@ int ef_vi_filter_add(ef_vi *vi, ef_driver_handle dh, const ef_filter_spec *fs,
     unsigned flags = 0;
     int rxq_no = 0;
 
-    if( vi->vi_flags & EF_VI_RX_EXCLUSIVE )
-      flags |= CI_FILTER_FLAG_EXCLUSIVE_RXQ;
-      
+
     if( vi->efct_shm ) {
+
+      /* The main intention for this is to reuse an rxq already given to the application if already given.
+       * This means that if an application requests an ANY queue, subsequent calls to filter_add should steer
+       * traffic to this preferred queue. Hence we should transform the CI_FILTER_FLAG_ANY_RXQ to
+       * CI_FILTER_FLAG_PREF_RXQ.
+       */
       if( vi->efct_shm->q[0].superbuf_pkts ) {
         flags |= CI_FILTER_FLAG_PREF_RXQ;
         rxq_no = vi->efct_shm->q[0].qid;
       }
       
+      /* If there is no preferred queue strategy, any should be fine so best hence let the driver choose. */
       if ( flags == 0 && !(fs->type & EF_FILTER_HAS_DEST) )
         flags |= CI_FILTER_FLAG_ANY_RXQ;
     }
-    
 
+    if ( fs->flags & EF_FILTER_FLAG_EXCLUSIVE_RXQ )
+      flags |= CI_FILTER_FLAG_EXCLUSIVE_RXQ;
 
     rc = ef_filter_add(dh, vi->vi_resource_id, rxq_no, fs, flags, &cookie, &rxq);
     if( rc < 0 )
@@ -556,6 +576,59 @@ int ef_vi_filter_del(ef_vi *vi, ef_driver_handle dh,
   if( ! vi->vi_clustered )
     return ef_filter_del(dh, vi->vi_resource_id, filter_cookie);
   return 0;
+}
+
+
+int ef_vi_filter_query(ef_vi* vi, ef_driver_handle vi_dh,
+                       const ef_filter_cookie* filter_cookie,
+                       ef_filter_info* filter_info, size_t filter_info_size)
+{
+  ci_resource_op_t op;
+  int rc;
+
+  if( filter_info_size != sizeof(ef_filter_info) )
+    return -EINVAL;
+
+  memset(filter_info, 0, filter_info_size);
+  if (filter_cookie->filter_type == EF_FILTER_PORT_SNIFF ||
+      filter_cookie->filter_type == EF_FILTER_TX_PORT_SNIFF ) {
+    /* These filter types are special and don't have IDs. Just claim success
+     * (without even validating) but return no info */
+    return 0;
+  }
+
+  memset(&op, 0, sizeof(op));
+  op.id = efch_make_resource_id(vi->vi_resource_id);
+  op.op = CI_RSOP_FILTER_QUERY;
+  op.u.filter_query.filter_id = filter_cookie->filter_id;
+  rc = ci_resource_op(vi_dh, &op);
+  if( rc < 0 ) {
+    /* EOPNOTSUPP comes back from hardware types which do not return any useful
+     * info. This function represents that by returning valid_fields==0, not by
+     * returning an error. */
+    return rc == -EOPNOTSUPP ? 0 : rc;
+  }
+  if( op.u.filter_query.out_hw_id >= 0 ) {
+    filter_info->valid_fields |= EF_FILTER_FIELD_ID;
+    filter_info->filter_id = op.u.filter_query.out_hw_id;
+  }
+  if( op.u.filter_query.out_rxq >= 0 ) {
+    filter_info->valid_fields |= EF_FILTER_FIELD_QUEUE;
+    filter_info->q_id = op.u.filter_query.out_rxq;
+  }
+  filter_info->flags = op.u.filter_query.out_flags;
+  return 0;
+}
+
+
+int ef_vi_filter_is_block_only(const struct ef_filter_cookie* cookie)
+{
+  if( (cookie->filter_type & ~(EF_FILTER_BLOCK_KERNEL |
+                               EF_FILTER_BLOCK_KERNEL_UNICAST |
+                               EF_FILTER_BLOCK_KERNEL_MULTICAST)) == 0 )
+    return 1;
+  else
+    return 0;
 }
 
 

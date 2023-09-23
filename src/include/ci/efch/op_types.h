@@ -142,7 +142,6 @@ struct efch_efct_rxq_alloc {
   /*bool*/uint8_t     in_timestamp_req;
   uint32_t            in_n_hugepages;
   int32_t             in_memfd;
-  uint64_t            in_memfd_off;
 };
 
 
@@ -214,6 +213,8 @@ typedef struct ci_resource_op_s {
 # define                CI_RSOP_EXT_FREE                0x89
 # define                CI_RSOP_EXT_MSG                 0x8A
 # define                CI_RSOP_RXQ_REFRESH             0x8B
+# define                CI_RSOP_FILTER_QUERY            0x8C
+# define                CI_RSOP_VI_DESIGN_PARAMETERS    0x8D
 
   union {
     struct {
@@ -272,6 +273,12 @@ typedef struct ci_resource_op_s {
       int32_t           filter_id;
     } filter_del;
     struct {
+      int32_t           filter_id;
+      int32_t           out_rxq;
+      int32_t           out_hw_id;
+      int32_t           out_flags;
+    } filter_query;
+    struct {
       int32_t           out_rx_ts_correction;
     } vi_rx_ts_correction;
     struct {
@@ -319,6 +326,10 @@ typedef struct ci_resource_op_s {
       uint64_t          current_mappings;
       uint32_t          max_superbufs;
     } rxq_refresh;
+    struct {
+      uint64_t          data_ptr; /* struct efab_nic_design_parameters */
+      uint64_t          data_len;
+    } design_parameters;
   } u CI_ALIGN(8);
 } ci_resource_op_t;
 

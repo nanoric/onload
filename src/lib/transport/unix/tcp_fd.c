@@ -325,7 +325,8 @@ citp_tcp_socket(int domain, int type, int protocol)
   /* BUG1408: Fail gracefully. We let the OS have a go at this so long as it's
    * not been caused by a driver/library mis-match */
   if( CITP_OPTS.no_fail && errno != ELIBACC ) {
-    Log_U(ci_log("%s: failed (errno:%d) - PASSING TO OS", __FUNCTION__, errno));
+    Log_U(ci_log("%s: failed (errno:%d strerror:%s) - PASSING TO OS",
+      __FUNCTION__, errno, strerror(errno)));
     return CI_SOCKET_HANDOVER;
   }
   return -1;
@@ -2209,7 +2210,7 @@ citp_tcp_ds_prepare(citp_fdinfo* fdi, int size, unsigned flags,
   /* Basic checks */
   if( s->tx_errno != 0
 #if CI_CFG_TIMESTAMPING
-      || (s->timestamping_flags & ONLOAD_SOF_TIMESTAMPING_STREAM)
+      || onload_timestamping_want_tx_nic(s->timestamping_flags)
 #endif
       )
     return ONLOAD_DELEGATED_SEND_RC_BAD_SOCKET;

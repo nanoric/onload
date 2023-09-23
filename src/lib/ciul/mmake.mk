@@ -43,7 +43,6 @@ LIB_SRCS	+=		\
 		vi_layout.c	\
 		vi_stats.c	\
 		vi_prime.c	\
-		vi_discard.c	\
 		capabilities.c	\
 		smartnic_exts.c	\
 		ctpio.c
@@ -155,7 +154,7 @@ lib_obj_path = $(BUILDPATH)/lib/ciul
 
 lib_obj_cmd = $(LD) -r $(LIB_SRCS:%.c=%.o) -o $(lib_obj)
 all:
-	$(MAKE) $(MMAKE_KBUILD_ARGS) KBUILD_BUILTIN=1 KBUILD_EXTMOD=$(lib_obj_path)
+	$(MAKE) $(MMAKE_KBUILD_ARGS) KBUILD_BUILTIN=1 KBUILD_EXTMOD=$(lib_obj_path) $(KBUILD_LIB_MAKE_TRG)
 	$(lib_obj_cmd)
 	echo "cmd_$(lib_obj_path)/$(lib_obj) := $(lib_obj_cmd)" > .$(lib_obj).cmd
 clean:

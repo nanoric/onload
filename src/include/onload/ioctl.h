@@ -121,9 +121,6 @@ enum {
                                                  oo_sock_attach_t)
 #endif
 
-  OO_OP_CLOSE,
-#define OO_IOC_CLOSE                OO_IOC_W(CLOSE, ci_uint32)
-
   /* OS-specific TCP helper operations */
 
   OO_OP_OS_SOCK_CREATE_AND_SET,
@@ -246,6 +243,13 @@ enum {
 #define OO_IOC_EFCT_SUPERBUF_CONFIG_REFRESH \
                                OO_IOC_W(EFCT_SUPERBUF_CONFIG_REFRESH, \
                                         oo_efct_superbuf_config_refresh_t)
+
+  OO_OP_PKT_BUF_MAP,
+#define OO_IOC_PKT_BUF_MMAP OO_IOC_RW(PKT_BUF_MAP, oo_pkt_buf_map_t)
+
+  OO_OP_DESIGN_PARAMETERS,
+#define OO_IOC_DESIGN_PARAMETERS OO_IOC_RW(DESIGN_PARAMETERS, \
+                                           oo_design_parameters_t)
 
   OO_OP_CONTIG_END,  /* This is the last in range of contigous opcodes */
 

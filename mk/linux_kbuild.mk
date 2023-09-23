@@ -39,20 +39,45 @@ ifndef NDEBUG
 EXTRA_CFLAGS += -g
 endif
 
+HAVE_EFCT ?=
+
+ifeq ($(HAVE_EFCT),0)
+HAVE_CNS_AUX := 0
+else ifneq ($(wildcard $(dir $(KPATH))/*/include/linux/auxiliary_bus.h),)
+HAVE_KERNEL_AUX := 1
+HAVE_CNS_AUX := 0
+else
 AUX_BUS_PATH ?= $(TOPPATH)/../cns-auxiliary-bus
 HAVE_CNS_AUX := $(or $(and $(wildcard $(AUX_BUS_PATH)),1),0)
-EXTRA_CFLAGS += -DCI_HAVE_CNS_AUX=$(HAVE_CNS_AUX)
-ifneq ($(HAVE_CNS_AUX),0)
-EXTRA_CFLAGS += -DCI_AUX_HEADER='"$(AUX_BUS_PATH)/include/linux/auxiliary_bus.h"'
-EXTRA_CFLAGS += -DCI_AUX_MOD_HEADER='"$(AUX_BUS_PATH)/drivers/base/mod_devicetable_auxiliary.h"'
 endif
 
-X3_NET_HDR := linux/net/xilinx/xlnx_efct.h
+CI_HAVE_AUX_BUS := $(or $(filter 1, $(HAVE_CNS_AUX) $(HAVE_KERNEL_AUX)),0)
+EXTRA_CFLAGS += -DCI_HAVE_AUX_BUS=$(CI_HAVE_AUX_BUS)
+
+ifneq ($(HAVE_CNS_AUX),0)
+EXTRA_CFLAGS += -I$(AUX_BUS_PATH)/include
+endif
+
+ifeq ($(HAVE_EFCT),0)
+else ifeq ($(CI_HAVE_AUX_BUS),0)
+else ifneq ($(wildcard $(dir $(KPATH))/*/include/linux/net/xilinx/xlnx_efct.h),)
+HAVE_KERNEL_EFCT := 1
+else
 X3_NET_PATH ?= $(TOPPATH)/../x3-net-linux
-HAVE_X3_NET := $(or $(and $(wildcard $(X3_NET_PATH)),1),0)
-EXTRA_CFLAGS += -DCI_HAVE_X3_NET=$(HAVE_X3_NET)
-ifneq ($(HAVE_X3_NET),0)
- EXTRA_CFLAGS += -DCI_XLNX_EFCT_HEADER='"$(X3_NET_PATH)/include/$(X3_NET_HDR)"'
+HAVE_CNS_EFCT := $(or $(and $(wildcard $(X3_NET_PATH)/include/linux/net/xilinx/xlnx_efct.h),1),0)
+endif
+
+ifeq ($(or $(filter 1, $(HAVE_KERNEL_EFCT) $(HAVE_CNS_EFCT)),0),1)
+  EXTRA_CFLAGS += -DCI_HAVE_EFCT_AUX=1
+  ifneq ($(HAVE_CNS_EFCT),0)
+    EXTRA_CFLAGS += -I$(X3_NET_PATH)/include
+  endif
+else
+  ifneq ($(HAVE_EFCT),1)
+    EXTRA_CFLAGS += -DCI_HAVE_EFCT_AUX=0
+  else
+    $(error Unable to build Onload with EFCT or AUX bus support)
+  endif
 endif
 
 HAVE_SFC ?= 1
@@ -67,6 +92,10 @@ EXTRA_CFLAGS += -DTRANSPORT_CONFIG_OPT_HDR='<$(TRANSPORT_CONFIG_OPT_HDR)>'
 
 EXTRA_CFLAGS += $(MMAKE_CFLAGS) $(EXTRA_CPPFLAGS)
 EXTRA_AFLAGS += $(EXTRA_CPPFLAGS)
+
+ifdef M_NO_OUTLINE_ATOMICS
+EXTRA_CFLAGS += -mno-outline-atomics
+endif
 
 # Linux 4.6 added some object-file validation, which was also merged into
 # RHEL 7.3.  Unfortunately, it assumes that all functions that don't end with

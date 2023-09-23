@@ -12,6 +12,7 @@ extern struct efhw_func_ops efct_char_functional_units;
 struct efhw_efct_rxq;
 struct xlnx_efct_hugepage;
 struct xlnx_efct_rxq_params;
+struct oo_hugetlb_allocator;
 typedef void efhw_efct_rxq_free_func_t(struct efhw_efct_rxq*);
 typedef void efhw_efct_rxq_int_wake_func_t(struct efhw_efct_rxq*);
 
@@ -36,8 +37,7 @@ struct efhw_efct_rxq {
 };
 
 /* TODO EFCT find somewhere better to put this */
-#define CI_EFCT_MAX_RXQS  8
-#define CI_EFCT_MAX_EVQS 24
+#define CI_EFCT_EVQ_DUMMY_MAX 1024
 
 struct efhw_nic_efct_rxq {
   struct efhw_efct_rxq *new_apps;  /* Owned by process context */
@@ -94,6 +94,7 @@ struct efct_filter_node {
     u32 key_start;   /* marker for 'this is the beginning of the key' */
     int32_t vlan;   /* -1 for any (i.e. don't care if it has a VLAN tag) */
   };
+  uint8_t loc_mac[ETH_ALEN];
   uint16_t ethertype;
   uint8_t proto;
   uint16_t rport;
@@ -139,45 +140,67 @@ struct efct_filter_set {
   size_t semi_wild_n;
   struct hlist_head ethertype[64];
   size_t ethertype_n;
+  struct hlist_head mac[64];
+  size_t mac_n;
+  struct hlist_head mac_vlan[64];
+  size_t mac_vlan_n;
 };
-
-#define MAX_EFCT_HW_FILTERS  256
 
 /* Totally arbitrary numbers: */
 static const size_t MAX_ALLOWED_full_match = 32768;
 static const size_t MAX_ALLOWED_semi_wild = 32768;
 static const size_t MAX_ALLOWED_ethertype = 128;
+static const size_t MAX_ALLOWED_mac = 128;
+static const size_t MAX_ALLOWED_mac_vlan = 128;
 
 #define FOR_EACH_FILTER_CLASS(action) \
   action(full_match) \
   action(semi_wild) \
-  action(ethertype)
+  action(ethertype) \
+  action(mac) \
+  action(mac_vlan)
 
 struct efct_hw_filter {
   int drv_id;
   unsigned refcount;
+  uint32_t hw_id;
   uint8_t rxq;
   uint8_t proto;
   uint16_t port;
   uint32_t ip;
+  uint8_t loc_mac[ETH_ALEN];
+  /* Although the VLAN field is 16 bits, we use an int32_t so we can use -1
+   * mean unset. We use this for comparisons with the vlan field in
+   * efct_filter_node, so keeping the types aligned avoids unpleasant
+   * size/signedness shenanigans in those cases. */
+  int32_t outer_vlan;
 };
 
 #define EFCT_NIC_BLOCK_KERNEL_UNICAST 0x1
 #define EFCT_NIC_BLOCK_KERNEL_MULTICAST 0x2
 
 struct efhw_nic_efct {
-  struct efhw_nic_efct_rxq rxq[CI_EFCT_MAX_RXQS];
-  struct efhw_nic_efct_evq evq[CI_EFCT_MAX_EVQS];
+  uint32_t rxq_n;
+  uint32_t evq_n;
+  struct efhw_nic_efct_rxq *rxq;
+  struct efhw_nic_efct_evq *evq;
   struct xlnx_efct_device *edev;
   struct xlnx_efct_client *client;
   struct efhw_nic *nic;
+  /* This array is used for marking whether a given hw_qid is exclusively owned.
+   * The index represents the hardware_queue, and the value should correspond to a 
+   * token representing exclusive ownership of the rxq. In this case, a token_id
+   * of 0 indicates the rxq is not being used. Otherwise the queue is owned and in-use.
+   */
+  uint32_t* exclusive_rxq_mapping;
 #ifdef __KERNEL__
   /* ZF emu includes this file from UL */
   /* We could have one filter set per rxq, effectively adding a few more bits
    * to the hash key. Let's not for now: the memory trade-off doesn't seem
    * worth it */
   struct efct_filter_set filters;
-  struct efct_hw_filter hw_filters[MAX_EFCT_HW_FILTERS];
+  uint32_t hw_filters_n;
+  struct efct_hw_filter *hw_filters;
   struct mutex driver_filters_mtx;
   uint8_t block_kernel;
 #endif
@@ -185,7 +208,8 @@ struct efhw_nic_efct {
 
 #if CI_HAVE_EFCT_AUX
 int efct_nic_rxq_bind(struct efhw_nic *nic, int qid, bool timestamp_req,
-                      size_t n_hugepages, struct file* memfd, off_t* memfd_off,
+                      size_t n_hugepages,
+                      struct oo_hugetlb_allocator *hugetlb_alloc,
                       struct efab_efct_rxq_uk_shm_q *shm,
                       unsigned wakeup_instance, struct efhw_efct_rxq *rxq);
 void efct_nic_rxq_free(struct efhw_nic *nic, struct efhw_efct_rxq *rxq,

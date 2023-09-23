@@ -5,6 +5,8 @@
 #define LIB_EFHW_EFCT_H
 
 struct xlnx_efct_client;
+struct oo_hugetlb_allocator;
+
 static inline struct xlnx_efct_client*
 efhw_nic_acquire_efct_device(struct efhw_nic* nic)
 {
@@ -30,13 +32,10 @@ efhw_nic_release_efct_device(struct efhw_nic* nic,
   if (!dev) { \
     rc = -ENODEV; \
   } \
-  /* [nic->resetting] means we have detected that we are in a reset.
-   * There is potentially a period after [nic->resetting] is cleared
-   * but before driverlink is re-enabled, during which time [efct_cli]
-   * will be NULL. */ \
-  else if ((nic)->resetting || (efct_cli) == NULL) { \
-    /* user should not handle any errors */ \
-    rc = 0; \
+  else if ((efct_cli) == NULL) { \
+    /* This means the NIC has been removed. We don't have hotplug support
+     * for efct, so need to report the error. */ \
+    rc = -ENETDOWN; \
   } \
   else { \
     /* Driverlink handle is valid and we're not resetting, so issue
@@ -56,8 +55,8 @@ efhw_nic_release_efct_device(struct efhw_nic* nic,
   put_device((dev)); \
 }
 
-void efct_provide_bind_memfd(struct file* memfd, off_t memfd_off);
-void efct_unprovide_bind_memfd(off_t *final_off);
+void efct_provide_hugetlb_alloc(struct oo_hugetlb_allocator *hugetlb_alloc);
+void efct_unprovide_hugetlb_alloc(void);
 
 #endif
 

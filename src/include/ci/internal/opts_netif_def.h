@@ -854,14 +854,6 @@ CI_CFG_OPT("EF_DYNAMIC_ACK_THRESH", dynack_thresh, ci_uint16,
            , , 16, 0, 65535, count)
 #endif
 
-CI_CFG_OPT("EF_CHALLENGE_ACK_LIMIT", challenge_ack_limit,
-           ci_uint32,
-"Limit the number of \"challenge ACK packets\" sent as part of TCP blind "
-"window attack mitigation, RFC 5961; in packets per second.  "
-"The limitation applies for each Onload stack separately.\n"
-"The value from /proc/sys/net/ipv4/tcp_challenge_ack_limit is used by default.",
-          , , CI_CFG_CHALLENGE_ACK_LIMIT, 0, 65535, count)
-
 CI_CFG_OPT("EF_INVALID_ACK_RATELIMIT", oow_ack_ratelimit, ci_uint32,
 "Limit the rate of ACKs sent because of invalid incoming TCP packet, "
 "in milliseconds.  The limitation is applied per-socket.  "
@@ -1110,7 +1102,7 @@ CI_CFG_OPT("EF_TCP_SNDBUF_ESTABLISHED_DEFAULT", tcp_sndbuf_est_def, ci_uint32,
 "This variable overrides OS default SO_SNDBUF value only, it does not "
 "change SO_SNDBUF if the application explicitly sets it "
 "(see EF_TCP_SNDBUF variable which overrides application-supplied value).",
-           ,  , 128 * 1024, MIN, MAX, bincount)
+           ,  , 128 * 1024, 0, SMAX/4, bincount)
 
 CI_CFG_OPT("EF_TCP_RCVBUF_ESTABLISHED_DEFAULT", tcp_rcvbuf_est_def, ci_uint32,
 "Overrides the OS default SO_RCVBUF value for TCP sockets in the ESTABLISHED "
@@ -1124,7 +1116,7 @@ CI_CFG_OPT("EF_TCP_RCVBUF_ESTABLISHED_DEFAULT", tcp_rcvbuf_est_def, ci_uint32,
 "This variable overrides OS default SO_RCVBUF value only, it does not "
 "change SO_RCVBUF if the application explicitly sets it "
 "(see EF_TCP_RCVBUF variable which overrides application-supplied value).",
-           ,  , 128 * 1024, MIN, MAX, bincount)
+           ,  , 128 * 1024, 0, SMAX/4, bincount)
 
 CI_CFG_OPT("", tcp_sndbuf_min, ci_uint32,
 "Minimum value for SO_SNDBUF for TCP sockets.  Set via O/S interface.",
@@ -1177,22 +1169,22 @@ CI_CFG_OPT("", udp_rcvbuf_max, ci_uint32,
 CI_CFG_OPT("EF_TCP_SNDBUF", tcp_sndbuf_user, ci_uint32,
 "Override SO_SNDBUF for TCP sockets (Note: the actual size of the buffer is "
 "double the amount requested, mimicking the behavior of the Linux kernel.)",
-           ,  tcp_sndbuf,     0, MIN, MAX, bincount)
+           ,  tcp_sndbuf,     0, 0, SMAX/2, bincount)
 
 CI_CFG_OPT("EF_TCP_RCVBUF", tcp_rcvbuf_user, ci_uint32,
 "Override SO_RCVBUF for TCP sockets. (Note: the actual size of the buffer is "
 "double the amount requested, mimicking the behavior of the Linux kernel.)",
-           ,  tcp_rcvbuf, 0, MIN, MAX, bincount)
+           ,  tcp_rcvbuf, 0, 0, SMAX/2, bincount)
 
 CI_CFG_OPT("EF_UDP_SNDBUF", udp_sndbuf_user, ci_uint32,
 "Override SO_SNDBUF for UDP sockets. (Note: the actual size of the buffer is "
 "double the amount requested, mimicking the behavior of the Linux kernel.)",
-           ,  udp_sndbuf, 0, MIN, MAX, bincount)
+           ,  udp_sndbuf, 0, 0, SMAX/2, bincount)
 
 CI_CFG_OPT("EF_UDP_RCVBUF", udp_rcvbuf_user, ci_uint32,
 "Override SO_RCVBUF for UDP sockets. (Note: the actual size of the buffer is "
 "double the amount requested, mimicking the behavior of the Linux kernel.)",
-           ,  udp_rcvbuf, 0, MIN, MAX, bincount)
+           ,  udp_rcvbuf, 0, 0, SMAX/2, bincount)
 
 CI_CFG_OPT("EF_TCP_BACKLOG_MAX", tcp_backlog_max, ci_uint32,
 "Places an upper limit on the number of embryonic (half-open) connections for "
@@ -1735,3 +1727,11 @@ CI_CFG_OPT("EF_ICMP_PKTS", icmp_msg_max, ci_uint32,
            "Maximum number of ICMP messages which can be queued to "
            "one Onload stack.",
            , , 64, 2, 1024, count)
+
+CI_CFG_OPT("EF_NO_HW", no_hw, ci_uint32,
+"Prevents the stack from allocating hardware resources. Local connections are "
+"still accelerated, but remote connections are handed over to the kernel. If "
+"the use of SO_REUSEPORT creates a cluster, then new stacks in the cluster "
+"will allocate resources, and will be fully accelerated.",
+           1, , 0, 0, 1, yesno)
+

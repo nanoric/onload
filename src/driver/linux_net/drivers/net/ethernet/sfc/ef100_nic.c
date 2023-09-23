@@ -283,6 +283,11 @@ int efx_ef100_init_datapath_caps(struct efx_nic *efx)
 	pci_dbg(efx->pci_dev,
 		"firmware reports num_mac_stats = %u\n",
 		efx->num_mac_stats);
+#ifdef CONFIG_SFC_VDPA
+	nic_data->vdpa_supported = efx_ef100_has_cap(nic_data->datapath_caps3,
+						     CLIENT_CMD_VF_PROXY) &&
+				   efx->type->is_vf;
+#endif
 	return 0;
 }
 
@@ -580,15 +585,12 @@ int ef100_phy_probe(struct efx_nic *efx)
 int ef100_filter_table_probe(struct efx_nic *efx)
 {
 	struct ef100_nic_data *nic_data = efx->nic_data;
-	bool rss_limited, additional_rss;
+	bool additional_rss;
 
-	rss_limited = efx_ef100_has_cap(nic_data->datapath_caps,
-					RX_RSS_LIMITED);
 	additional_rss = efx_ef100_has_cap(nic_data->datapath_caps,
 					   ADDITIONAL_RSS_MODES);
 
-	return efx_mcdi_filter_table_probe(efx, rss_limited,
-					   additional_rss);
+	return efx_mcdi_filter_table_probe(efx, additional_rss);
 }
 
 static int ef100_filter_table_init(struct efx_nic *efx)
@@ -639,6 +641,21 @@ static void ef100_filter_table_down(struct efx_nic *efx)
 	nic_data->filters_up = false;
 out:
 	up_write(&efx->filter_sem);
+}
+
+static int efx_ef100_rx_push_rss_config(struct efx_nic *efx, bool user,
+					const u32 *rx_indir_table,
+					const u8 *key)
+{
+	struct ef100_nic_data *nic_data = efx->nic_data;
+
+	if (efx_ef100_has_cap(nic_data->datapath_caps, RX_RSS_LIMITED))
+		return -EOPNOTSUPP;
+	/* on EF100 we have many available RSS contexts, so use the PF version
+	 * of push_rss_config for both PFs and VFs rather than the "VF"
+	 * version that's conservative about allocating RSS contexts.
+	 */
+	return efx_mcdi_rx_push_rss_config(efx, user, rx_indir_table, key);
 }
 
 /*	Other
@@ -1251,119 +1268,57 @@ static struct {
 		.init = ef100_probe_netdev,
 		.fini = ef100_remove_netdev
 	},
-#if defined(EFX_USE_KCOMPAT) && !defined(EFX_HAVE_VDPA_MGMT_INTERFACE)
 #ifdef CONFIG_SFC_VDPA
 	[EF100_BAR_CONFIG_VDPA] = {
 		.init = ef100_vdpa_init,
 		.fini = ef100_vdpa_fini
 	},
 #endif
-#endif
-#ifdef EFX_NOT_UPSTREAM
 	[EF100_BAR_CONFIG_NONE] = {
 		.init = NULL,
 		.fini = NULL
 	},
-#endif
 };
 
-static ssize_t bar_config_show(struct device *dev,
-			       struct device_attribute *attr, char *buf_out)
+/* Keep this in sync with the definition of enum ef100_bar_config. */
+static char *bar_config_name[] = {
+	[EF100_BAR_CONFIG_NONE] = "None",
+	[EF100_BAR_CONFIG_EF100] = "EF100",
+	[EF100_BAR_CONFIG_VDPA] = "vDPA",
+};
+
+int efx_ef100_set_bar_config(struct efx_nic *efx,
+			     enum ef100_bar_config new_config)
 {
-	struct efx_nic *efx = pci_get_drvdata(to_pci_dev(dev));
 	struct ef100_nic_data *nic_data = efx->nic_data;
-
-	switch (nic_data->bar_config) {
-	case EF100_BAR_CONFIG_EF100:
-		scnprintf(buf_out, PAGE_SIZE, "EF100\n");
-		break;
-#ifdef CONFIG_SFC_VDPA
-	case EF100_BAR_CONFIG_VDPA:
-		scnprintf(buf_out, PAGE_SIZE, "vDPA\n");
-		break;
-#endif
-#ifdef EFX_NOT_UPSTREAM
-	case EF100_BAR_CONFIG_NONE:
-		scnprintf(buf_out, PAGE_SIZE, "None\n");
-		break;
-#endif
-	default: /* this should not happen */
-		WARN_ON_ONCE(1);
-		return 0;
-	}
-
-	return strlen(buf_out);
-}
-
-static ssize_t bar_config_store(struct device *dev,
-				struct device_attribute *attr,
-				const char *buf, size_t count)
-{
-	struct efx_nic *efx = pci_get_drvdata(to_pci_dev(dev));
-	struct ef100_nic_data *nic_data = efx->nic_data;
-	enum ef100_bar_config new_config, old_config;
 	struct efx_probe_data *probe_data;
+	enum ef100_bar_config old_config;
 	int rc;
 
+	if (WARN_ON_ONCE(nic_data->bar_config > EF100_BAR_CONFIG_VDPA))
+		return -EINVAL;
+
+#ifdef CONFIG_SFC_VDPA
 	/* Current EF100 hardware supports vDPA on VFs only
 	 * (see SF-122427-SW)
 	 */
-	if (!efx->type->is_vf && sysfs_streq(buf, "vdpa")) {
+	if (new_config == EF100_BAR_CONFIG_VDPA && !nic_data->vdpa_supported) {
 		pci_err(efx->pci_dev, "vdpa over PF not supported : %s",
 			efx->name);
 		return -EOPNOTSUPP;
 	}
-
+#endif
 	mutex_lock(&nic_data->bar_config_lock);
-	if (sysfs_streq(buf, "ef100"))
-		new_config = EF100_BAR_CONFIG_EF100;
-#if defined(EFX_USE_KCOMPAT) && !defined(EFX_HAVE_VDPA_MGMT_INTERFACE)
-#ifdef CONFIG_SFC_VDPA
-	else if (sysfs_streq(buf, "vdpa"))
-		new_config = EF100_BAR_CONFIG_VDPA;
-#endif
-#endif
-#ifdef EFX_NOT_UPSTREAM
-	else if (sysfs_streq(buf, "none"))
-		new_config = EF100_BAR_CONFIG_NONE;
-#endif
-	else {
-		mutex_unlock(&nic_data->bar_config_lock);
-		return -EIO;
-	}
 	old_config = nic_data->bar_config;
 	if (new_config == old_config) {
 		mutex_unlock(&nic_data->bar_config_lock);
-		return count;
+		return 0;
 	}
 
-#ifdef CONFIG_SFC_VDPA
-#if defined(EFX_USE_KCOMPAT) && !defined(EFX_HAVE_VDPA_MGMT_INTERFACE)
-	/* When vdpa Management interface is not supported change
-	 * of bar_config which results in vdpa device deletion
-	 * should be denied, if vdpa device is in use.
-	 */
-	if (old_config == EF100_BAR_CONFIG_VDPA && ef100_vdpa_dev_in_use(efx)) {
-		pci_warn(efx->pci_dev,
-			 "Device in use. Cannot change bar config");
-		mutex_unlock(&nic_data->bar_config_lock);
-		return -EBUSY;
-	}
-#else
-	/* Restrict bar_config writes when vdpa device has been created
-	 * using management interface
-	 */
-	if (old_config == EF100_BAR_CONFIG_VDPA) {
-		pci_warn(efx->pci_dev,
-			 "Device in use. Cannot change bar config");
-		mutex_unlock(&nic_data->bar_config_lock);
-		return -EBUSY;
-	}
-#endif
-#endif
 	probe_data = container_of(efx, struct efx_probe_data, efx);
 	if (bar_config_std[old_config].fini)
 		bar_config_std[old_config].fini(probe_data);
+	nic_data->bar_config = EF100_BAR_CONFIG_NONE;
 
 	if (bar_config_std[new_config].init) {
 		rc = bar_config_std[new_config].init(probe_data);
@@ -1376,11 +1331,73 @@ static ssize_t bar_config_store(struct device *dev,
 	nic_data->bar_config = new_config;
 	mutex_unlock(&nic_data->bar_config_lock);
 
-	pci_info(efx->pci_dev, "BAR configuration changed to %s", buf);
-	return count;
+	pci_info(efx->pci_dev, "BAR configuration changed to %s\n",
+		 bar_config_name[new_config]);
+	return 0;
+}
+
+#ifdef EFX_NOT_UPSTREAM
+static ssize_t bar_config_show(struct device *dev,
+			       struct device_attribute *attr, char *buf_out)
+{
+	struct efx_nic *efx = pci_get_drvdata(to_pci_dev(dev));
+	struct ef100_nic_data *nic_data = efx->nic_data;
+
+	if (WARN_ON_ONCE(nic_data->bar_config > EF100_BAR_CONFIG_VDPA))
+		return 0; /* this should not happen */
+	else
+		return scnprintf(buf_out, PAGE_SIZE, "%s\n",
+				 bar_config_name[nic_data->bar_config]);
+}
+
+static ssize_t bar_config_store(struct device *dev,
+				struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct efx_nic *efx = pci_get_drvdata(to_pci_dev(dev));
+#ifdef CONFIG_SFC_VDPA
+	struct ef100_nic_data *nic_data = efx->nic_data;
+#endif
+	enum ef100_bar_config new_config;
+	int rc;
+
+	if (sysfs_streq(buf, "ef100"))
+		new_config = EF100_BAR_CONFIG_EF100;
+#ifdef CONFIG_SFC_VDPA
+	else if (sysfs_streq(buf, "vdpa"))
+		new_config = EF100_BAR_CONFIG_VDPA;
+#endif
+	else if (sysfs_streq(buf, "none"))
+		new_config = EF100_BAR_CONFIG_NONE;
+	else
+		return -EIO;
+
+#ifdef CONFIG_SFC_VDPA
+	/* Restrict bar_config writes when vdpa device has been created
+	 * using management interface
+	 */
+#if defined(EFX_USE_KCOMPAT) && !defined(EFX_HAVE_VDPA_MGMT_INTERFACE)
+	/* When vdpa Management interface is not supported change
+	 * of bar_config which results in vdpa device deletion
+	 * should be denied, if vdpa device is in use.
+	 */
+	if (nic_data->bar_config == EF100_BAR_CONFIG_VDPA &&
+	    ef100_vdpa_dev_in_use(efx)) {
+#else
+	if (nic_data->bar_config == EF100_BAR_CONFIG_VDPA) {
+#endif
+		pci_warn(efx->pci_dev,
+			 "Device in use. Cannot change bar config");
+		return -EBUSY;
+	}
+#endif
+
+	rc = efx_ef100_set_bar_config(efx, new_config);
+	return rc ?: count;
 }
 
 static DEVICE_ATTR_RW(bar_config);
+#endif
 
 enum ef100_tlv_state_machine {
 	EF100_TLV_TYPE,
@@ -1571,6 +1588,35 @@ out:
 	return rc;
 }
 
+static int efx_ef100_update_client_id(struct efx_nic *efx)
+{
+	struct ef100_nic_data *nic_data = efx->nic_data;
+	unsigned int pf_index = PCIE_FUNCTION_PF_NULL;
+	unsigned int vf_index = PCIE_FUNCTION_VF_NULL;
+	efx_qword_t pciefn;
+	int rc;
+
+	if (efx->pci_dev->is_virtfn)
+		vf_index = nic_data->vf_index;
+	else
+		pf_index = nic_data->pf_index;
+
+	/* Construct PCIE_FUNCTION structure */
+	EFX_POPULATE_QWORD_3(pciefn,
+			     PCIE_FUNCTION_PF, pf_index,
+			     PCIE_FUNCTION_VF, vf_index,
+			     PCIE_FUNCTION_INTF, PCIE_INTERFACE_CALLER);
+	/* look up self client ID */
+	rc = efx_ef100_lookup_client_id(efx, pciefn, &efx->client_id);
+	if (rc) {
+		pci_warn(efx->pci_dev,
+			 "%s: Failed to get client ID, rc %d\n",
+			 __func__, rc);
+	}
+
+	return rc;
+}
+
 /*	NIC probe and remove
  */
 static int ef100_probe_main(struct efx_nic *efx)
@@ -1595,6 +1641,7 @@ static int ef100_probe_main(struct efx_nic *efx)
 	spin_lock_init(&nic_data->udp_tunnels_lock);
 	INIT_LIST_HEAD(&nic_data->udp_tunnels);
 #endif
+	mutex_init(&nic_data->bar_config_lock);
 	efx->max_vis = EF100_MAX_VIS;
 
 	/* Populate design-parameter defaults */
@@ -1666,12 +1713,16 @@ static int ef100_probe_main(struct efx_nic *efx)
 	if (rc)
 		goto fail;
 
+	rc = efx_ef100_update_client_id(efx);
+	if (rc)
+		goto fail;
+
 	efx_mcdi_get_privilege_mask(efx, &privlege_mask);
 	nic_data->grp_mae = !!(privlege_mask &
 			       MC_CMD_PRIVILEGE_MASK_IN_GRP_MAE);
-
-	mutex_init(&nic_data->bar_config_lock);
+#ifdef EFX_NOT_UPSTREAM
 	rc = device_create_file(&efx->pci_dev->dev, &dev_attr_bar_config);
+#endif
 
 	return 0;
 fail:
@@ -1749,38 +1800,36 @@ int ef100_probe_vf(struct efx_nic *efx)
 {
 #if defined(CONFIG_SFC_VDPA)
 #if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_VDPA_MGMT_INTERFACE)
+	int err;
+#endif
+#endif
 	int rc;
 
-	rc = ef100_vdpa_register_mgmtdev(efx);
-	if (rc)
-		pci_warn(efx->pci_dev,
-			 "vDPA Management device registration failed\n");
-#endif
-#endif
 	BUILD_BUG_ON(MAE_MPORT_SELECTOR_NULL);
 
-	return ef100_probe_main(efx);
+	rc = ef100_probe_main(efx);
+#if defined(CONFIG_SFC_VDPA)
+#if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_VDPA_MGMT_INTERFACE)
+	err = ef100_vdpa_register_mgmtdev(efx);
+	if (err)
+		pci_warn(efx->pci_dev,
+			 "vdpa_register_mgmtdev failed, err: %d\n", err);
+#endif
+#endif
+	return rc;
 }
 
 void ef100_remove(struct efx_nic *efx)
 {
 	struct ef100_nic_data *nic_data = efx->nic_data;
-#ifdef CONFIG_SFC_VDPA
-	struct efx_probe_data *probe_data;
-	probe_data = container_of(efx, struct efx_probe_data, efx);
-	if (nic_data && (nic_data->bar_config == EF100_BAR_CONFIG_VDPA))
-		ef100_vdpa_fini(probe_data);
-#endif
+
+#ifdef EFX_NOT_UPSTREAM
 	device_remove_file(&efx->pci_dev->dev, &dev_attr_bar_config);
+#endif
 	efx_remove_common(efx);
 	if (nic_data) {
 		if (efx->mcdi_buf_mode == EFX_BUF_MODE_EF100)
 			efx_nic_free_buffer(efx, &nic_data->mcdi_buf);
-#if defined(CONFIG_SFC_VDPA)
-		else
-			ef100_vdpa_free_buffer(efx->vdpa_nic,
-					       &nic_data->mcdi_buf);
-#endif
 		mutex_destroy(&nic_data->bar_config_lock);
 	}
 
@@ -1805,7 +1854,7 @@ void ef100_remove(struct efx_nic *efx)
 #define EF100_OFFLOAD_FEATURES	(NETIF_F_HW_CSUM | NETIF_F_RXCSUM |	\
 	NETIF_F_HIGHDMA | NETIF_F_SG | NETIF_F_FRAGLIST | NETIF_F_NTUPLE | \
 	NETIF_F_RXHASH | NETIF_F_RXFCS | NETIF_F_TSO_ECN | NETIF_F_RXALL | \
-	NETIF_F_HW_VLAN_CTAG_TX)
+	NETIF_F_HW_VLAN_CTAG_TX | NETIF_F_HW_VLAN_CTAG_FILTER)
 #endif
 
 const struct efx_nic_type ef100_pf_nic_type = {
@@ -1900,7 +1949,7 @@ const struct efx_nic_type ef100_pf_nic_type = {
 	.rx_ts_offset = ESF_GZ_RX_PREFIX_PARTIAL_TSTAMP_LBN / 8,
 	.rx_hash_key_size = 40,
 	.rx_pull_rss_config = efx_mcdi_rx_pull_rss_config,
-	.rx_push_rss_config = efx_mcdi_pf_rx_push_rss_config,
+	.rx_push_rss_config = efx_ef100_rx_push_rss_config,
 	.rx_push_rss_context_config = efx_mcdi_rx_push_rss_context_config,
 	.rx_pull_rss_context_config = efx_mcdi_rx_pull_rss_context_config,
 	.rx_restore_rss_contexts = efx_mcdi_rx_restore_rss_contexts,
@@ -2033,7 +2082,7 @@ const struct efx_nic_type ef100_vf_nic_type = {
 	.rx_ts_offset = ESF_GZ_RX_PREFIX_PARTIAL_TSTAMP_LBN / 8,
 	.rx_hash_key_size = 40,
 	.rx_pull_rss_config = efx_mcdi_rx_pull_rss_config,
-	.rx_push_rss_config = efx_mcdi_pf_rx_push_rss_config,
+	.rx_push_rss_config = efx_ef100_rx_push_rss_config,
 	.rx_restore_rss_contexts = efx_mcdi_rx_restore_rss_contexts,
 	.rx_recycle_ring_size = efx_ef100_recycle_ring_size,
 

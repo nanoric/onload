@@ -1653,6 +1653,7 @@ static ssize_t efrm_add_rule(struct file *file, const char __user *ubuf,
 static const struct proc_ops efrm_fops_add_rule = {
 	PROC_OPS_SET_OWNER
 	.proc_write		= efrm_add_rule,
+	.proc_lseek		= default_llseek,
 };
 
 static ssize_t efrm_del_rule(struct file *file, const char __user *ubuf,
@@ -1725,6 +1726,7 @@ static ssize_t efrm_del_rule(struct file *file, const char __user *ubuf,
 static const struct proc_ops efrm_fops_del_rule = {
 	PROC_OPS_SET_OWNER
 	.proc_write		= efrm_del_rule,
+	.proc_lseek		= default_llseek,
 };
 
 /* ********************************************* */
@@ -2054,82 +2056,18 @@ int efrm_filter_rename( struct efhw_nic *nic, struct net_device *net_dev )
 	return 0;
 }
 
-int efrm_rss_mode_to_nic_flags(struct efhw_nic *efhw_nic, u32 efrm_rss_mode,
-			       u32 *flags_out)
-{
-	int rc;
-	u32 rss_flags;
-	u32 nic_tcp_mode;
-	u32 nic_src_mode = (1 << RSS_MODE_HASH_SRC_ADDR_LBN) |
-			   (1 << RSS_MODE_HASH_SRC_PORT_LBN);
-	u32 nic_dst_mode = (1 << RSS_MODE_HASH_DST_ADDR_LBN) |
-			   (1 << RSS_MODE_HASH_DST_PORT_LBN);
-	u32 nic_all_mode = nic_src_mode | nic_dst_mode;
-	ci_dword_t nic_flags_new;
-	ci_dword_t nic_flags_mask;
-
-	rc = efhw_nic_rss_flags(efhw_nic, &rss_flags);
-	if( rc < 0 )
-		return rc;
-
-        /* we need to use default flags in packed stream mode,
-         * note in that case TCP hashing will surely be enabled,
-         * so nothing to do there anyway */
-        if( efhw_nic->flags & NIC_FLAG_RX_RSS_LIMITED ) {
-		*flags_out = rss_flags;
-		return 0;
-	}
-
-	switch(efrm_rss_mode) {
-	case EFRM_RSS_MODE_SRC:
-		nic_tcp_mode = nic_src_mode;
-		break;
-	case EFRM_RSS_MODE_DST:
-		nic_tcp_mode = nic_dst_mode;
-		break;
-	case EFRM_RSS_MODE_DEFAULT:
-		nic_tcp_mode = nic_all_mode;
-		break;
-	default:
-		EFHW_ASSERT(!"Unknown rss mode");
-		return -EINVAL;
-	};
-
-	CI_POPULATE_DWORD_2(nic_flags_mask,
-		MC_CMD_RSS_CONTEXT_SET_FLAGS_IN_TOEPLITZ_TCPV4_EN,
-                     (1 << MC_CMD_RSS_CONTEXT_SET_FLAGS_IN_TOEPLITZ_IPV4_EN_WIDTH) - 1,
-		MC_CMD_RSS_CONTEXT_SET_FLAGS_IN_TCP_IPV4_RSS_MODE,
-                     ( efhw_nic->flags & NIC_FLAG_ADDITIONAL_RSS_MODES ) ?
-                     (1 << MC_CMD_RSS_CONTEXT_SET_FLAGS_IN_TCP_IPV4_RSS_MODE_WIDTH) - 1 :
-                     0
-		);
-	CI_POPULATE_DWORD_2(nic_flags_new,
-		MC_CMD_RSS_CONTEXT_SET_FLAGS_IN_TOEPLITZ_TCPV4_EN, 1,
-		MC_CMD_RSS_CONTEXT_SET_FLAGS_IN_TCP_IPV4_RSS_MODE, nic_tcp_mode
-		);
-        EFHW_ASSERT((nic_flags_new.u32[0] & nic_flags_mask.u32[0]) == nic_flags_new.u32[0]);
-	*flags_out = (rss_flags & ~nic_flags_mask.u32[0]) |
-		     nic_flags_new.u32[0];
-	return 0;
-}
 
 int efrm_rss_context_alloc(struct efrm_client* client, u32 vport_id,
 			   int shared,
 			   const u32 *indir,
-			   const u8 *key, u32 efrm_rss_mode,
+			   const u8 *key, u32 efhw_rss_mode,
 			   int num_qs,
 			   u32 *rss_context_out)
 {
 	int rc;
 	struct efhw_nic *efhw_nic = efrm_client_get_nic(client);
-	u32 rss_flags;
 
-	rc = efrm_rss_mode_to_nic_flags(efhw_nic, efrm_rss_mode, &rss_flags);
-	if( rc < 0 )
-		return rc;
-
-	/* Driverlink API takes ef10 MCDI compatible RSS flags */
-	rc = efhw_nic_rss_alloc(efhw_nic, indir, key, rss_flags,
+	rc = efhw_nic_rss_alloc(efhw_nic, indir, key, efhw_rss_mode,
 				num_qs, rss_context_out);
 
 	return rc;
@@ -2138,17 +2076,12 @@ EXPORT_SYMBOL(efrm_rss_context_alloc);
 
 
 int efrm_rss_context_update(struct efrm_client* client, u32 rss_context,
-			    const u32 *indir, const u8 *key, u32 efrm_rss_mode)
+			    const u32 *indir, const u8 *key, u32 efhw_rss_mode)
 {
 	struct efhw_nic *efhw_nic = efrm_client_get_nic(client);
-	u32 nic_rss_flags;
 	int rc;
 
-	rc = efrm_rss_mode_to_nic_flags(efhw_nic, efrm_rss_mode, &nic_rss_flags);
-	if( rc < 0 )
-		return rc;
-
-	rc = efhw_nic_rss_update(efhw_nic, indir, key, nic_rss_flags, rss_context);
+	rc = efhw_nic_rss_update(efhw_nic, indir, key, efhw_rss_mode, rss_context);
 
 	return rc;
 }
@@ -2182,8 +2115,9 @@ EXPORT_SYMBOL(efrm_vport_free);
 /* ************************************************************* */
 
 int efrm_filter_insert(struct efrm_client *client,
-		       struct efx_filter_spec *spec, int *rxq,
-		       const struct cpumask *mask, unsigned flags)
+			   struct efx_filter_spec *spec, int *rxq,
+			   unsigned pd_excl_owner, const struct cpumask *mask,
+			   unsigned flags)
 {
 	struct efhw_nic *efhw_nic = efrm_client_get_nic(client);
 	struct net_device* net_dev;
@@ -2193,7 +2127,7 @@ int efrm_filter_insert(struct efrm_client *client,
 	/* FIXME: add IPv6 support to firewall rules (bug 85208) */
 	if ( (spec->match_flags & EFX_FILTER_MATCH_ETHER_TYPE) &&
 	     (spec->ether_type == htons(ETH_P_IPV6)) ) {
-		return efhw_nic_filter_insert( efhw_nic, spec, rxq, mask, flags );
+		return efhw_nic_filter_insert( efhw_nic, spec, rxq, pd_excl_owner, mask, flags );
 	}
 #endif
 
@@ -2209,7 +2143,7 @@ int efrm_filter_insert(struct efrm_client *client,
 		}
 		dev_put(net_dev);
 		if ( rc >= 0 )
-			rc = efhw_nic_filter_insert( efhw_nic, spec, rxq, mask, flags );
+			rc = efhw_nic_filter_insert( efhw_nic, spec, rxq, pd_excl_owner, mask, flags );
 	}
 	else {
 		rc = -ENODEV;
@@ -2234,6 +2168,21 @@ int efrm_filter_redirect(struct efrm_client *client, int filter_id,
 	return efhw_nic_filter_redirect(efhw_nic, filter_id, spec);
 }
 EXPORT_SYMBOL(efrm_filter_redirect);
+
+
+int efrm_filter_query(struct efrm_client *client, int filter_id, int *rxq,
+                      int *hw_id, int* flags)
+{
+	struct efhw_nic *efhw_nic = efrm_client_get_nic(client);
+	struct efhw_filter_info info = {.rxq = -1, .hw_id = -1, .flags = 0};
+	int rc = efhw_nic_filter_query(efhw_nic, filter_id, &info);
+	/* No reason not to set these unconditionally (i.e. ignore rc): */
+	*rxq = info.rxq;
+	*hw_id = info.hw_id;
+	*flags = info.flags;
+	return rc;
+}
+EXPORT_SYMBOL(efrm_filter_query);
 
 
 int efrm_filter_block_kernel(struct efrm_client *client, int flags, bool block)
@@ -2269,6 +2218,4 @@ EXPORT_SYMBOL(efrm_filter_block_kernel);
 ci_inline void build_tests(void) {
 	CI_BUILD_ASSERT(EFRM_RSS_KEY_LEN ==
 			MC_CMD_RSS_CONTEXT_SET_KEY_IN_TOEPLITZ_KEY_LEN);
-	CI_BUILD_ASSERT(EFRM_RSS_INDIRECTION_TABLE_LEN ==
-			MC_CMD_RSS_CONTEXT_SET_TABLE_IN_INDIRECTION_TABLE_LEN);
 }

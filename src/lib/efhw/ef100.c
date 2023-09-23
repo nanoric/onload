@@ -123,6 +123,7 @@ ef100_nic_tweak_hardware(struct efhw_nic *nic)
 	nic->flags |= NIC_FLAG_PHYS_CONTIG_EVQ | NIC_FLAG_PHYS_CONTIG_TXQ |
 		      NIC_FLAG_PHYS_CONTIG_RXQ;
 	nic->flags |= NIC_FLAG_EVQ_IRQ;
+	nic->flags |= NIC_FLAG_SHARED_PD;
 
 	/* Determine what the filtering capabilies are */
 	ef10_ef100_nic_check_supported_filters(nic);
@@ -160,6 +161,9 @@ ef100_nic_init_hardware(struct efhw_nic *nic,
 
 	/* No buffer_table_ctor() on EF100 */
 	/* No non_irq_evq on EF100 */
+
+	nic->rss_indir_size = EF10_EF100_RSS_INDIRECTION_TABLE_LEN;
+	nic->rss_key_size = EF10_EF100_RSS_KEY_LEN;
 
 	return 0;
 }
@@ -796,6 +800,7 @@ struct efhw_func_ops ef100_char_functional_units = {
 	ef100_nic_wakeup_request,
 	ef100_nic_sw_event,
 	ef100_handle_event,
+	ef10_ef100_accept_vi_constraints,
 	ef100_dmaq_tx_q_init,
 	ef100_dmaq_rx_q_init,
 	ef10_ef100_flush_tx_dma_channel,
@@ -824,10 +829,10 @@ struct efhw_func_ops ef100_char_functional_units = {
 	ef10_ef100_rss_alloc,
 	ef10_ef100_rss_update,
 	ef10_ef100_rss_free,
-	ef10_ef100_rss_flags,
 	ef10_ef100_filter_insert,
 	ef10_ef100_filter_remove,
 	ef10_ef100_filter_redirect,
+	ef10_ef100_filter_query,
 	ef10_ef100_multicast_block,
 	ef10_ef100_unicast_block,
 	ef10_ef100_vport_alloc,
@@ -839,5 +844,6 @@ struct efhw_func_ops ef100_char_functional_units = {
 	ef100_vi_io_region,
 	ef100_inject_reset_ev,
 	ef100_ctpio_addr,
+	ef10_ef100_design_parameters,
 	ef10_ef100_max_shared_rxqs,
 };

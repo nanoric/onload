@@ -294,6 +294,9 @@ efch_vi_rm_alloc(ci_resource_alloc_t* alloc, ci_resource_table_t* rt,
     ps_buf_size = (int) alloc_in->ps_buf_size_kb * 1024;
   efrm_vi_attr_set_ps_buffer_size(&attr, ps_buf_size);
 
+  efrm_vi_attr_set_queue_types(&attr, alloc_in->rxq_capacity != 0,
+                               alloc_in->txq_capacity != 0);
+
   in_flags = alloc_in->flags | EFHW_VI_JUMBO_EN;
   if( rmpd != NULL && efrm_pd_stack_id_get(rmpd) > 0 )
     in_flags |= EFHW_VI_TX_LOOPBACK;
@@ -444,6 +447,24 @@ static void efch_vi_flush_complete(void *completion_void)
 }
 
 
+static int efch_vi_design_parameters(struct efrm_vi* virs, ci_resource_op_t* op)
+{
+  int rc;
+  struct efhw_nic* nic = efrm_client_get_nic(virs->rs.rs_client);
+  void *user_data = (void *)(unsigned long)op->u.design_parameters.data_ptr;
+  size_t data_len = op->u.design_parameters.data_len;
+  struct efab_nic_design_parameters dp = EFAB_NIC_DP_INITIALIZER;
+
+  if( dp.known_size > data_len )
+    dp.known_size = data_len;
+
+  rc = efhw_nic_design_parameters(nic, &dp);
+  if( rc < 0 )
+    return rc;
+
+  return copy_to_user(user_data, &dp, dp.known_size) ? -EFAULT : 0;
+}
+
 static int
 efch_vi_rm_rsops(efch_resource_t* rs, ci_resource_table_t* rt,
                  ci_resource_op_t* op, int* copy_out)
@@ -537,6 +558,12 @@ efch_vi_rm_rsops(efch_resource_t* rs, ci_resource_table_t* rt,
                                    &rs->vi.fl, op);
       break;
 
+    case CI_RSOP_FILTER_QUERY:
+      rc = efch_filter_list_op_query(rs->rs_base, efrm_vi_get_pd(virs),
+                                     &rs->vi.fl, op);
+      *copy_out = 1;
+      break;
+
     case CI_RSOP_VI_GET_RX_ERROR_STATS:
       {
         size_t data_len = op->u.vi_stats.data_len;
@@ -572,6 +599,10 @@ efch_vi_rm_rsops(efch_resource_t* rs, ci_resource_table_t* rt,
         efrm_client_get_nic(virs->rs.rs_client)->ts_format;
       rc = 0;
       *copy_out = 1;
+      break;
+
+    case CI_RSOP_VI_DESIGN_PARAMETERS:
+      rc = efch_vi_design_parameters(virs, op);
       break;
 
     default:

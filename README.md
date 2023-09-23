@@ -61,6 +61,14 @@ level of AF_XDP support for Onload:
 * Redhat Enterprise Linux 9.x
 * Linux kernel in the range 5.4 - 5.19
 
+If a netdriver does not support AF_XDP in native mode, Onload will try to use
+generic XDP mode when registering an interface. To make it work, one has to set
+up userland helper before registering the interface:
+```sh
+$ make -C ./src/tools/bpf_link_helper/
+$ echo $(realpath ./src/tools/bpf_link_helper/bpf-link-helper) | sudo tee /sys/module/sfc_resource/parameters/bpf_link_helper
+```
+
 ### Building without Xilinx NICs, for AF_XDP only
 
 OpenOnload can be built without SFC driver:
@@ -68,6 +76,9 @@ OpenOnload can be built without SFC driver:
 * `onload_build` & `onload_install`: use `--no-sfc` parameter;
 * `onload_tool reload`: use `--onload-only` parameter.
 
+Also, it can be built without EFCT and AUX support:
+* `make`: use `HAVE_EFCT=0` variable;
+* `onload_build`: use `--no-efct` parameter.
 
 ## Native Onload with Xilinx/AMD NICs
 
@@ -83,6 +94,7 @@ The following adapters at least are able to support OpenOnload without AF_XDP:
 
 * X2541
 * X2522, X2522-25G
+* X3522
 * SFN8042
 * SFN8522, SFN8542
 
@@ -91,10 +103,11 @@ The following adapters at least are able to support OpenOnload without AF_XDP:
 This source tree is known to work with Xilinx network adapters on following
 Linux distributions:
 
-* Ubuntu LTS 18.04, LTS 20.04, 21.04
+* Ubuntu LTS 18.04, LTS 20.04, LTS 22.04
 * Debian 10, 11
-* Redhat Enterprise Linux 7.9, 8.3, 8.4
-* Linux kernel in the range 4.15 - 5.17
+* Redhat Enterprise Linux 7.9, 8.1 - 8.7, 9.0 - 9.1
+* SuSE Linux Enterprise Server 15 SP1 - SP4
+* Linux kernel in the range 4.15 - 5.19
 
 ## Support
 
@@ -102,3 +115,7 @@ The publicly-hosted repository is a community-supported project.
 
 Supported releases of OpenOnload are available from
 https://www.xilinx.com/support/download/nic-software-and-drivers.html#open
+
+## Copyright
+
+This file: (c) Copyright 2020-2022 Xilinx, Inc.

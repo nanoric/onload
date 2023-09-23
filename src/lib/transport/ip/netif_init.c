@@ -26,9 +26,6 @@
 #include <cplane/create.h>
 #include <net/if.h>
 #include <ci/internal/efabcfg.h>
-#if CI_CFG_PKTS_AS_HUGE_PAGES
-#include <sys/shm.h>
-#endif
 #endif
 
 
@@ -298,7 +295,6 @@ static ci_uint32 citp_syn_opts = CI_TCPT_SYN_FLAGS;
 static ci_uint32 citp_tcp_dsack = CI_CFG_TCP_DSACK;
 static ci_uint32 citp_tcp_time_wait_assassinate = CI_CFG_TIME_WAIT_ASSASSINATE;
 static ci_uint32 citp_tcp_early_retransmit = 3;  /* default as of 3.10 */
-static ci_uint32 citp_challenge_ack_limit = CI_CFG_CHALLENGE_ACK_LIMIT;
 static ci_uint32 citp_tcp_invalid_ratelimit =
                         CI_CFG_TCP_OUT_OF_WINDOW_ACK_RATELIMIT;
 
@@ -455,9 +451,6 @@ ci_setup_ipstack_params(void)
   if (ci_sysctl_get_values("net/ipv4/tcp_early_retrans", opt, 1) == 0)
     citp_tcp_early_retransmit = opt[0];
 
-  if (ci_sysctl_get_values("net/ipv4/tcp_challenge_ack_limit", opt, 1) == 0)
-    citp_challenge_ack_limit = opt[0];
-
   if (ci_sysctl_get_values("net/ipv4/tcp_invalid_ratelimit", opt, 1) == 0)
     citp_tcp_invalid_ratelimit = opt[0];
 
@@ -536,12 +529,21 @@ void ci_netif_config_opts_defaults(ci_netif_config_opts* opts)
     opts->tcp_early_retransmit = citp_tcp_early_retransmit > 0 &&
                                  citp_tcp_early_retransmit < 4;
     opts->tail_drop_probe = citp_tcp_early_retransmit >= 3;
-    opts->challenge_ack_limit = citp_challenge_ack_limit;
     opts->oow_ack_ratelimit = citp_tcp_invalid_ratelimit;
 #if CI_CFG_IPV6
     opts->auto_flowlabels = citp_auto_flowlabels;
 #endif
     opts->inited = CI_TRUE;
+  }
+}
+
+static void round_opts(const char* opt_name, ci_uint32* opt, int multiplier)
+{
+  if( *opt % multiplier != 0 ) {
+    unsigned new_max = *opt;
+    new_max = CI_ROUND_UP(new_max, multiplier);
+    ci_log("config: %s is rounded up from %u to %u", opt_name, *opt, new_max);
+    *opt = new_max;
   }
 }
 
@@ -596,14 +598,14 @@ void ci_netif_config_opts_rangecheck(ci_netif_config_opts* opts)
   _min = (type)(minimum); /* about silly comparisons          */          \
   if (_val > _max) {                                                      \
     ci_log("config: "CI_CFG_MSG" - option " #name                         \
-           " (%"CI_PRIu64") larger than maximum " #maximum" (%"CI_PRIu64")",		  \
-           (ci_uint64)_val, (ci_uint64) _max);                                     \
+           " (%"CI_PRIu64") larger than maximum (%"CI_PRIu64")",          \
+           (ci_uint64)_val, (ci_uint64) _max);                            \
     CI_CFG_REDRESS(opts->name, _max);                                     \
   }                                                                       \
   if (_val < _min) {                                                      \
     ci_log("config: "CI_CFG_MSG" - option " #name                         \
-           " (%"CI_PRIu64") smaller than minimum " #minimum,		  \
-           (ci_uint64)_val);                                              \
+           " (%"CI_PRIu64") smaller than minimum (%"CI_PRIu64")",         \
+           (ci_uint64)_val, (ci_uint64) _min);                            \
     CI_CFG_REDRESS(opts->name, _min);                                     \
   }                                                                       \
 }                                               
@@ -611,12 +613,7 @@ void ci_netif_config_opts_rangecheck(ci_netif_config_opts* opts)
 # include <ci/internal/opts_netif_def.h>
 
   /* EF_MAX_ENDPOINTS should must be divisible by 2048 */
-  if( opts->max_ep_bufs % EP_BUF_PER_CHUNK != 0 ) {
-    unsigned new_max = opts->max_ep_bufs;
-    new_max = CI_ROUND_UP(new_max, EP_BUF_PER_CHUNK);
-    ci_log("config: EF_MAX_ENDPOINTS is rounded up from %u to %u", opts->max_ep_bufs, new_max);
-    opts->max_ep_bufs = new_max;
-  }
+  round_opts("EF_MAX_ENDPOINTS", &opts->max_ep_bufs, EP_BUF_PER_CHUNK);
 }
 
 
@@ -690,6 +687,7 @@ static void ci_netif_config_opts_getenv_ef_log(ci_netif_config_opts* opts)
     {EF_LOG_RESOURCE_WARNINGS, "resource_warnings"},
     {EF_LOG_CONN_DROP, "conn_drop"},
     {EF_LOG_CONFIG_WARNINGS, "config_warnings"},
+    {EF_LOG_MORE_CONFIG_WARNINGS, "more_config_warnings"},
     {EF_LOG_USAGE_WARNINGS, "usage_warnings"},
   };
 
@@ -916,8 +914,6 @@ void ci_netif_config_opts_getenv(ci_netif_config_opts* opts)
   opts->dynack_thresh = CI_MAX(opts->dynack_thresh, opts->delack_thresh);
 #endif
 
-  if ( (s = getenv("EF_CHALLENGE_ACK_LIMIT")) )
-    opts->challenge_ack_limit = atoi(s);
   if ( (s = getenv("EF_INVALID_ACK_RATELIMIT")) )
     opts->oow_ack_ratelimit = atoi(s);
 #if CI_CFG_FD_CACHING
@@ -1034,23 +1030,6 @@ void ci_netif_config_opts_getenv(ci_netif_config_opts* opts)
   if( (s = getenv("EF_TCP_RCVBUF_ESTABLISHED_DEFAULT")) )
     opts->tcp_rcvbuf_est_def = atoi(s);
 
-  if( opts->tcp_sndbuf_user != 0 ) {
-    opts->tcp_sndbuf_min = opts->tcp_sndbuf_max = opts->tcp_sndbuf_user;
-    opts->tcp_sndbuf_def = oo_adjust_SO_XBUF(opts->tcp_sndbuf_user);
-  }
-  if( opts->tcp_rcvbuf_user != 0 ) {
-    opts->tcp_rcvbuf_min = opts->tcp_rcvbuf_max = opts->tcp_rcvbuf_user;
-    opts->tcp_rcvbuf_def = oo_adjust_SO_XBUF(opts->tcp_rcvbuf_user);
-  }
-  if( opts->udp_sndbuf_user != 0 ) {
-    opts->udp_sndbuf_min = opts->udp_sndbuf_max = opts->udp_sndbuf_user;
-    opts->udp_sndbuf_def = oo_adjust_SO_XBUF(opts->udp_sndbuf_user);
-  }
-  if( opts->udp_rcvbuf_user != 0 ) {
-    opts->udp_rcvbuf_min = opts->udp_rcvbuf_max = opts->udp_rcvbuf_user;
-    opts->udp_rcvbuf_def = oo_adjust_SO_XBUF(opts->udp_rcvbuf_user);
-  }
-
   if ( (s = getenv("EF_RETRANSMIT_THRESHOLD_SYNACK")) )
     opts->retransmit_threshold_synack = atoi(s);
 
@@ -1075,23 +1054,51 @@ void ci_netif_config_opts_getenv(ci_netif_config_opts* opts)
    * tcp_synrecv_max * 2 / 7.
    * And we need some space for real endpoints. */
   if( opts->tcp_synrecv_max * 4 > opts->max_ep_bufs * 7 ) {
-    CONFIG_LOG(opts, CONFIG_WARNINGS, "%s: EF_TCP_SYNRECV_MAX=%d and "
-               "EF_MAX_ENDPOINTS=%d are inconsistent.",
-               opts->tcp_synrecv_max * 2 > opts->max_ep_bufs * 7 ?
-               "ERROR" : "WARNING",
-               opts->tcp_synrecv_max, opts->max_ep_bufs);
-    if( getenv("EF_TCP_SYNRECV_MAX") == NULL ) {
-      CONFIG_LOG(opts, CONFIG_WARNINGS, "EF_TCP_SYNRECV_MAX is set to %d "
-                 "based on %s value and assuming up to %d listening "
-                 "sockets in the Onload stack",
-                 opts->tcp_synrecv_max,
-                 getenv("EF_TCP_BACKLOG_MAX") == NULL ?
-                 "/proc/sys/net/ipv4/tcp_max_syn_backlog" :
-                 "EF_TCP_BACKLOG_MAX",
-                 CI_CFG_ASSUME_LISTEN_SOCKS);
+    if( getenv("EF_TCP_SYNRECV_MAX") == NULL && getenv("EF_MAX_ENDPOINTS") == NULL && getenv("EF_TCP_BACKLOG_MAX") == NULL ) {
+      /* None have been manually set so warn at lower
+       * config warning level. */
+      CONFIG_LOG(opts, MORE_CONFIG_WARNINGS, "%s: EF_TCP_SYNRECV_MAX=%d and "
+                "EF_MAX_ENDPOINTS=%d are inconsistent.",
+                opts->tcp_synrecv_max * 2 > opts->max_ep_bufs * 7 ?
+                "ERROR" : "WARNING",
+                opts->tcp_synrecv_max, opts->max_ep_bufs);
+      CONFIG_LOG(opts, MORE_CONFIG_WARNINGS, "EF_TCP_SYNRECV_MAX is set to %d "
+                "based on /proc/sys/net/ipv4/tcp_max_syn_backlog value and assuming up to %d listening "
+                "sockets in the Onload stack",
+                opts->tcp_synrecv_max,
+                CI_CFG_ASSUME_LISTEN_SOCKS);
+
+      round_opts("EF_MAX_ENDPOINTS", &opts->max_ep_bufs, EP_BUF_PER_CHUNK);
+      opts->tcp_synrecv_max = CI_ROUND_UP(opts->max_ep_bufs, EP_BUF_PER_CHUNK) * 7/4;
+      CONFIG_LOG(opts, MORE_CONFIG_WARNINGS, "EF_TCP_SYNRECV_MAX has been decreased"
+                " to %d to be consistent with EF_MAX_ENDPOINTS=%d",
+                opts->tcp_synrecv_max,
+                opts->max_ep_bufs);
+      if( opts->tcp_backlog_max > opts->tcp_synrecv_max ) {
+        opts->tcp_backlog_max = opts->tcp_synrecv_max;
+        CONFIG_LOG(opts, MORE_CONFIG_WARNINGS, "EF_TCP_BACKLOG_MAX has been decreased"
+                  " to %d to be consistent with EF_TCP_SYNRECV_MAX=%d",
+                  opts->tcp_backlog_max,
+                  opts->tcp_synrecv_max);
+      }
     }
-    CONFIG_LOG(opts, CONFIG_WARNINGS, "Too few endpoints requested: ~4 "
-               "syn-receive states consume one endpoint. ");
+    else {
+      /* Any have been manually set so give the user an Error or Warning */
+      CONFIG_LOG(opts, CONFIG_WARNINGS, "%s: EF_TCP_SYNRECV_MAX=%d and "
+                "EF_MAX_ENDPOINTS=%d are inconsistent.",
+                opts->tcp_synrecv_max * 2 > opts->max_ep_bufs * 7 ?
+                "ERROR" : "WARNING",
+                opts->tcp_synrecv_max, opts->max_ep_bufs);
+      if( getenv("EF_TCP_SYNRECV_MAX") == NULL ) {
+        CONFIG_LOG(opts, CONFIG_WARNINGS, "EF_TCP_SYNRECV_MAX is set to %d "
+                  "based on EF_TCP_BACKLOG_MAX value and assuming up to %d listening "
+                  "sockets in the Onload stack",
+                  opts->tcp_synrecv_max,
+                  CI_CFG_ASSUME_LISTEN_SOCKS);
+      }
+      CONFIG_LOG(opts, CONFIG_WARNINGS, "Too few endpoints requested: ~4 "
+                "syn-receive states consume one endpoint. ");
+    }
   }
 
   if ( (s = getenv("EF_TCP_INITIAL_CWND")) )
@@ -1293,6 +1300,9 @@ void ci_netif_config_opts_getenv(ci_netif_config_opts* opts)
   if( (s = getenv("EF_ICMP_PKTS")) )
     opts->icmp_msg_max = atoi(s);
 
+  if( (s = getenv("EF_NO_HW")) )
+    opts->no_hw = atoi(s);
+
 #if CI_CFG_TCP_OFFLOAD_RECYCLER || CI_CFG_TX_CRC_OFFLOAD
   static const char* const tcp_offload_opts[] = { "off", "tcp", "ceph", "nvme", 0 };
   opts->tcp_offload_plugin = parse_enum(opts, "EF_TCP_OFFLOAD",
@@ -1305,6 +1315,29 @@ void ci_netif_config_opts_getenv(ci_netif_config_opts* opts)
     opts->nvme_crc_table_cap = atoi(s);
 #endif
 }
+
+
+/* Set derived after the range check has been applied */
+void ci_netif_config_opts_set_derived(ci_netif_config_opts* opts)
+{
+  if( opts->tcp_sndbuf_user != 0 ) {
+    opts->tcp_sndbuf_min = opts->tcp_sndbuf_max = opts->tcp_sndbuf_user;
+    opts->tcp_sndbuf_def = oo_adjust_SO_XBUF(opts->tcp_sndbuf_user);
+  }
+  if( opts->tcp_rcvbuf_user != 0 ) {
+    opts->tcp_rcvbuf_min = opts->tcp_rcvbuf_max = opts->tcp_rcvbuf_user;
+    opts->tcp_rcvbuf_def = oo_adjust_SO_XBUF(opts->tcp_rcvbuf_user);
+  }
+  if( opts->udp_sndbuf_user != 0 ) {
+    opts->udp_sndbuf_min = opts->udp_sndbuf_max = opts->udp_sndbuf_user;
+    opts->udp_sndbuf_def = oo_adjust_SO_XBUF(opts->udp_sndbuf_user);
+  }
+  if( opts->udp_rcvbuf_user != 0 ) {
+    opts->udp_rcvbuf_min = opts->udp_rcvbuf_max = opts->udp_rcvbuf_user;
+    opts->udp_rcvbuf_def = oo_adjust_SO_XBUF(opts->udp_rcvbuf_user);
+  }
+}
+
 
 static int
 handle_str_opt(ci_netif_config_opts* opts,
@@ -1707,8 +1740,8 @@ static void netif_tcp_helper_munmap(ci_netif* ni)
     for( id = 0; id < ni->packets->sets_n; id++ ) {
       if( PKT_BUFSET_U_MMAPPED(ni, id) ) {
 #if CI_CFG_PKTS_AS_HUGE_PAGES
-        if( ni->packets->set[id].shm_id >= 0 )
-          rc = shmdt(ni->pkt_bufs[id]);
+        if( ni->packets->set[id].page_offset >= 0 )
+          rc = munmap(ni->pkt_bufs[id], CI_HUGEPAGE_SIZE);
         else
 #endif
         {
@@ -1948,7 +1981,8 @@ static int init_ef_vi(ci_netif* ni, int nic_i, int vi_state_offset,
                       int vi_io_offset, int vi_efct_shm_offset,
                       char** vi_mem_ptr,
                       ef_vi* vi, unsigned vi_instance, unsigned abs_idx,
-                      int evq_bytes, int txq_size, ef_vi_stats* vi_stats)
+                      int evq_bytes, int txq_size, ef_vi_stats* vi_stats,
+                      struct efab_nic_design_parameters* dp)
 {
   ef_vi_state* state = (void*) ((char*) ni->state + vi_state_offset);
   ci_netif_state_nic_t* nsn = &(ni->state->nic[nic_i]);
@@ -1966,6 +2000,11 @@ static int init_ef_vi(ci_netif* ni, int nic_i, int vi_state_offset,
   vi->dh = ci_netif_get_driver_handle(ni);
   *vi_mem_ptr = ef_vi_init_qs(vi, *vi_mem_ptr, ids, evq_bytes / 8,
                               nsn->vi_rxq_size, nsn->rx_prefix_len, txq_size);
+  if( vi->internal_ops.design_parameters ) {
+    int rc = vi->internal_ops.design_parameters(vi, dp);
+    if( rc < 0 )
+      return rc;
+  }
   if( vi->max_efct_rxq ) {
     int i;
     int rc = efct_vi_mmap_init_internal(vi,
@@ -1981,6 +2020,17 @@ static int init_ef_vi(ci_netif* ni, int nic_i, int vi_state_offset,
   ef_vi_init_tx_timestamping(vi, nsn->tx_ts_correction);
   ef_vi_add_queue(vi, vi);
   ef_vi_set_stats_buf(vi, vi_stats);
+  ef_vi_receive_set_discards(vi,
+      EF_VI_DISCARD_RX_L4_CSUM_ERR |
+      EF_VI_DISCARD_RX_L3_CSUM_ERR |
+      EF_VI_DISCARD_RX_ETH_FCS_ERR |
+      EF_VI_DISCARD_RX_ETH_LEN_ERR |
+      EF_VI_DISCARD_RX_INNER_L3_CSUM_ERR |
+      EF_VI_DISCARD_RX_INNER_L4_CSUM_ERR |
+      EF_VI_DISCARD_RX_L2_CLASS_OTHER |
+      EF_VI_DISCARD_RX_L3_CLASS_OTHER |
+      EF_VI_DISCARD_RX_L4_CLASS_OTHER 
+  );
   return 0;
 }
 
@@ -2043,6 +2093,18 @@ static int af_xdp_kick(ef_vi* vi)
   return oo_resource_op(fd, OO_IOC_AF_XDP_KICK, &intf_i);
 }
 
+static int get_design_parameters(ci_netif* ni, int nic_i,
+                                 struct efab_nic_design_parameters* dp)
+{
+  oo_design_parameters_t op;
+  int fd = ci_netif_get_driver_handle(ni);
+
+  op.intf_i = nic_i;
+  CI_USER_PTR_SET(op.data_ptr, dp);
+  op.data_len = sizeof(*dp);
+  return oo_resource_op(fd, OO_IOC_DESIGN_PARAMETERS, &op);
+}
+
 static int netif_tcp_helper_build(ci_netif* ni)
 {
   /* On entry we require the following to be initialised:
@@ -2093,6 +2155,7 @@ static int netif_tcp_helper_build(ci_netif* ni)
     ef_vi* vi;
     int i;
     int num_vis = ci_netif_num_vis(ni);
+    struct efab_nic_design_parameters dp;
 
     /* Get interface properties. */
     rc = oo_cp_get_hwport_properties(ni->cplane, ns->intf_i_to_hwport[nic_i],
@@ -2109,6 +2172,10 @@ static int netif_tcp_helper_build(ci_netif* ni)
     rc = ef_vi_arch_from_efhw_arch(nsn->vi_arch);
     CI_TEST(rc >= 0);
 
+    rc = get_design_parameters(ni, nic_i, &dp);
+    if( rc < 0 )
+      goto fail1;
+
     vi_state_bytes = 0;
     for( i = 0; i < num_vis; ++i ) {
       vi = &ni->nic_hw[nic_i].vis[i];
@@ -2116,7 +2183,7 @@ static int netif_tcp_helper_build(ci_netif* ni)
                       vi_efct_shm_offset,
                       &vi_mem_ptr, vi, nsn->vi_instance[i], nsn->vi_abs_idx[i],
                       i ? 0 : nsn->vi_evq_bytes, nsn->vi_txq_size,
-                      &ni->state->vi_stats);
+                      &ni->state->vi_stats, &dp);
       if( rc )
         goto fail2;
       ++vis_inited;
@@ -2318,7 +2385,6 @@ ci_inline void netif_tcp_helper_free(ci_netif* ni)
   ci_netif_deinit(ni);
 }
 
-
 static void init_resource_alloc(ci_resource_onload_alloc_t* ra,
                                 const ci_netif_config_opts* opts,
                                 unsigned flags, const char* name)
@@ -2340,18 +2406,34 @@ static void init_resource_alloc(ci_resource_onload_alloc_t* ra,
   if( name != NULL )
     strncpy(ra->in_name, name, CI_CFG_STACK_NAME_LEN);
 
-  ra->in_memfd = -1;
-#ifdef MFD_HUGETLB
-  /* The kernel code can cope with no memfd being provided, but only on older
-   * kernels */
+  ra->in_efct_memfd = -1;
+  ra->in_pktbuf_memfd = -1;
+
+  /* The kernel code can cope with no memfd being provided in both cases
+   * (in_efct_memfd and in_pktbuf_memfd), but only on older kernels, i.e.
+   * older than 5.7 where the fallback with efrm_find_ksym() stopped working.
+   * Overall:
+   * - Onload uses the efrm_find_ksym() fallback on Linux older than 4.14.
+   * - Both efrm_find_ksym() and memfd_create(MFD_HUGETLB) are available
+   *   on Linux between 4.14 and 5.7.
+   * - Onload can use only memfd_create(MFD_HUGETLB) on Linux 5.7+. */
   {
     char mfd_name[CI_CFG_STACK_NAME_LEN + 8];
     snprintf(mfd_name, sizeof(mfd_name), "efct/%s", name);
-    ra->in_memfd = memfd_create(mfd_name, MFD_CLOEXEC | MFD_HUGETLB);
-    if( ra->in_memfd < 0 && errno != ENOSYS )
+    ra->in_efct_memfd = syscall(__NR_memfd_create, mfd_name,
+                                MFD_CLOEXEC | MFD_HUGETLB);
+    if( ra->in_efct_memfd < 0 && errno != ENOSYS )
       LOG_S(ci_log("%s: memfd_create failed %d", __FUNCTION__, errno));
   }
-#endif
+  /* Packet buffers */
+  {
+    char mfd_name[CI_CFG_STACK_NAME_LEN + 8];
+    snprintf(mfd_name, sizeof(mfd_name), "pktbuf/%s", name);
+    ra->in_pktbuf_memfd = syscall(__NR_memfd_create, mfd_name,
+                                  MFD_CLOEXEC | MFD_HUGETLB);
+    if( ra->in_pktbuf_memfd < 0 && errno != ENOSYS )
+      LOG_S(ci_log("%s: memfd_create failed %d", __FUNCTION__, errno));
+  }
 }
 
 
@@ -2375,8 +2457,11 @@ netif_tcp_helper_alloc_u(ef_driver_handle fd, ci_netif* ni,
    * we get an EINTR and want to try again. */
   while( (rc = oo_resource_alloc(fd, &ra)) == -EINTR );
 
-  if( ra.in_memfd >= 0 )
-    ci_sys_close(ra.in_memfd);
+  if( ra.in_efct_memfd >= 0 )
+    ci_sys_close(ra.in_efct_memfd);
+
+  if( ra.in_pktbuf_memfd >= 0 )
+    ci_sys_close(ra.in_pktbuf_memfd);
 
   if( rc < 0 ) {
     switch( rc ) {
@@ -2422,7 +2507,7 @@ netif_tcp_helper_alloc_u(ef_driver_handle fd, ci_netif* ni,
    */
   ni->nic_set = ra.out_nic_set;
   LOG_NC(ci_log("%s: nic set %" EFRM_NIC_SET_FMT, __FUNCTION__,
-	                efrm_nic_set_pri_arg(&ni->nic_set)));
+                efrm_nic_set_pri_arg(&ni->nic_set)));
   ni->mmap_bytes = ra.out_netif_mmap_bytes;
 
   /****************************************************************************
@@ -2450,7 +2535,7 @@ netif_tcp_helper_alloc_u(ef_driver_handle fd, ci_netif* ni,
 
   if( ns->flags & CI_NETIF_FLAG_ONLOAD_UNSUPPORTED ) {
     ci_log("*** Warning: use of %s with this adapter is likely",
-	   onload_product);
+           onload_product);
     ci_log("***  to show suboptimal performance for all cases other than the");
     ci_log("***  most trivial benchmarks.  Please see your Solarflare");
     ci_log("***  representative/reseller to obtain an Onload-capable");
@@ -2919,12 +3004,13 @@ int ci_netif_ctor(ci_netif* ni, ef_driver_handle fd, const char* stack_name,
   return 0;
 }
 
-#else  /* __KERNEL__ */
+#endif  /* __KERNEL__ */
 
 int ci_netif_set_rxq_limit(ci_netif* ni)
 {
   int intf_i, n_intf, max_ring_pkts, fill_limit;
   int rc = 0, rxq_cap = 0;
+  int rxq_limit = NI_OPTS(ni).rxq_limit;
 
   /* Ensure we use a sensible [rxq_limit] when packet buf constrained.
    * This is necessary to ensure that the first interface doesn't fill its
@@ -2945,25 +3031,24 @@ int ci_netif_set_rxq_limit(ci_netif* ni)
   fill_limit = rxq_cap;
   if( fill_limit * n_intf > max_ring_pkts )
     fill_limit = max_ring_pkts / n_intf;
-  if( fill_limit < NI_OPTS(ni).rxq_limit ) {
+  if( fill_limit < rxq_limit ) {
     if( fill_limit < rxq_cap )
       LOG_W(ci_log("WARNING: "N_FMT "RX ring fill level reduced from %d to %d "
                    "max_ring_pkts=%d rxq_cap=%d n_intf=%d",
-                   N_PRI_ARGS(ni), NI_OPTS(ni).rxq_limit, fill_limit,
+                   N_PRI_ARGS(ni), rxq_limit, fill_limit,
                    max_ring_pkts, rxq_cap, n_intf));
-    ni->opts.rxq_limit = fill_limit;
-    ni->state->opts.rxq_limit = fill_limit;
+    rxq_limit = fill_limit;
   }
   if( ni->nic_n == 0 ) {
     /* we do not use .rxq_limit, but let's make all checkers happy */
-     NI_OPTS(ni).rxq_limit = CI_CFG_RX_DESC_BATCH;
+     rxq_limit = CI_CFG_RX_DESC_BATCH;
   }
-  else if( NI_OPTS(ni).rxq_limit < NI_OPTS(ni).rxq_min ) {
+  else if( rxq_limit < NI_OPTS(ni).rxq_min ) {
     /* Do not allow user to create a stack that is too severely
      * constrained.
      */
     LOG_E(ci_log("ERROR: "N_FMT "rxq_limit=%d is too small (rxq_min=%d)",
-                 N_PRI_ARGS(ni), NI_OPTS(ni).rxq_limit, NI_OPTS(ni).rxq_min);
+                 N_PRI_ARGS(ni), rxq_limit, NI_OPTS(ni).rxq_min);
           ci_log("HINT: Use a larger value for EF_RXQ_LIMIT or "
                  "EF_MAX_RX_PACKETS or EF_MAX_PACKETS"));
     rc = -ENOMEM;
@@ -2971,12 +3056,13 @@ int ci_netif_set_rxq_limit(ci_netif* ni)
      * failure to allocate more packet buffers.  So we must leave
      * [rxq_limit] with a legal value.
      */
-    NI_OPTS(ni).rxq_limit = 2 * CI_CFG_RX_DESC_BATCH + 1;
+    rxq_limit = 2 * CI_CFG_RX_DESC_BATCH + 1;
   }
-  ni->state->rxq_limit = NI_OPTS(ni).rxq_limit;
+  ni->state->rxq_limit = ni->state->rxq_base_limit = rxq_limit;
   return rc;
 }
 
+#ifdef __KERNEL__
 static void ci_netif_af_xdp_post_fill(ci_netif* ni)
 {
   /* some ZC UMEM implementation can take a jiffy to schedule HW rx ring refill */
@@ -3016,11 +3102,16 @@ int ci_netif_init_fill_rx_rings(ci_netif* ni)
   oo_pkt_p pkt_list;
   int lim, rc, n_reserved, n_requested, n_accounted;
 
+  /* This could legitimately fail for AF_XDP, having already allocated all
+   * available buffers earlier in the initialisation process. So we check
+   * whether there has been a successful allocation at some point, rather than
+   * whether this particular attempt succeeds. */
   rc = ci_tcp_helper_more_bufs(ni);
   if( ni->packets->n_free == 0 ) {
-    LOG_E(ci_log("%s: [%d] ERROR: failed to allocate initial packet set: %d",
-                 __func__, NI_ID(ni), rc));
-    return -ENOMEM;
+    if( rc != -EINTR )
+      LOG_E(ci_log("%s: [%d] ERROR: failed to allocate initial packet set: %d",
+                   __func__, NI_ID(ni), rc));
+    return rc < 0 ? rc : -ENOMEM;
   }
   ni->packets->id = 0;
 
@@ -3056,7 +3147,7 @@ int ci_netif_init_fill_rx_rings(ci_netif* ni)
    * are short of packet buffers, we don't fill some rings completely and
    * leave others empty.
    */
-  for( lim = CI_CFG_RX_DESC_BATCH; lim <= NI_OPTS(ni).rxq_limit;
+  for( lim = CI_CFG_RX_DESC_BATCH; lim <= ni->state->rxq_base_limit;
        lim += CI_CFG_RX_DESC_BATCH ) {
     ni->state->rxq_limit = lim;
     if( (rc = __ci_netif_init_fill_rx_rings(ni)) < 0 || ni->state->rxq_low ) {
@@ -3064,7 +3155,7 @@ int ci_netif_init_fill_rx_rings(ci_netif* ni)
       if( lim < NI_OPTS(ni).rxq_min )
         LOG_E(ci_log("%s: ERROR: Insufficient packet buffers to fill RX rings "
                      "(rxq_limit=%d rxq_low=%d rxq_min=%d)", __FUNCTION__,
-                     NI_OPTS(ni).rxq_limit, ni->state->rxq_low,
+                     ni->state->rxq_base_limit, ni->state->rxq_low,
                      NI_OPTS(ni).rxq_min));
 #if CI_CFG_PKTS_AS_HUGE_PAGES
       else if( NI_OPTS(ni).huge_pages == OO_IOBUFSET_FLAG_HUGE_PAGE_FORCE )
@@ -3084,7 +3175,7 @@ int ci_netif_init_fill_rx_rings(ci_netif* ni)
      * packets as indicated by EF_MIN_FREE_PACKETS */
     ci_netif_pkt_reserve_free(ni, pkt_list, n_reserved);
   }
-  ni->state->rxq_limit =  NI_OPTS(ni).rxq_limit;
+  ni->state->rxq_limit = ni->state->rxq_base_limit;
 
 #if CI_CFG_PKTS_AS_HUGE_PAGES
   /* Initial packets allocated: allow other packets to be in non-huge pages

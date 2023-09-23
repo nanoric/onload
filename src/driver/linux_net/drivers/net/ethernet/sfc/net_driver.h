@@ -45,6 +45,9 @@
 #ifndef EFX_USE_KCOMPAT
 #include <net/busy_poll.h>
 #endif
+#if !defined(EFX_USE_KCOMPAT) || defined(EFX_USE_DEVLINK)
+#include <net/devlink.h>
+#endif
 #if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_XDP_RXQ_INFO)
 #include <net/xdp.h>
 #endif
@@ -94,7 +97,7 @@
  **************************************************************************/
 
 #ifdef EFX_NOT_UPSTREAM
-#define EFX_DRIVER_VERSION	"5.3.13.1006"
+#define EFX_DRIVER_VERSION	"5.3.14.1019"
 #endif
 
 #ifdef DEBUG
@@ -383,7 +386,7 @@ struct efx_tx_queue {
 #endif
 #endif
 #endif
-#ifdef CONFIG_SFC_DEBUGFS
+#ifdef CONFIG_DEBUG_FS
 	/** @debug_dir: debugfs directory for this queue */
 	struct dentry *debug_dir;
 #endif
@@ -439,10 +442,10 @@ struct efx_tx_queue {
  * @addr: virtual address of buffer
  * @handle: hande to the umem buffer
  * @xsk_buf: umem buffer
- * @page_offset: If pending: offset in @page of DMA base address.
- *	If completed: offset in @page of Ethernet header.
- * @len: If pending: length for DMA descriptor.
- *	If completed: received length, excluding hash prefix.
+ * @page_offset: If pending this is the offset in @page of the DMA base address.
+ *	If completed this is the offset in @page of the Ethernet header.
+ * @len: If pending this is the length of a DMA descriptor.
+ *	If completed this is the received length, excluding hash prefix.
  * @flags: Flags for buffer and packet state.  These are only set on the
  *	first buffer of a scattered packet.
  * @vlan_tci: VLAN tag in host byte order. If the EFX_RX_PKT_VLAN_XTAG
@@ -731,7 +734,7 @@ struct efx_rx_queue {
 	struct efx_ssr_state ssr;
 #endif
 
-#ifdef CONFIG_SFC_DEBUGFS
+#ifdef CONFIG_DEBUG_FS
 	struct dentry *debug_dir;
 #endif
 
@@ -907,7 +910,7 @@ struct efx_channel {
 	u32 *rps_flow_id;
 #endif
 
-#ifdef CONFIG_SFC_DEBUGFS
+#ifdef CONFIG_DEBUG_FS
 	struct dentry *debug_dir;
 #endif
 #if defined(EFX_USE_KCOMPAT) && defined(EFX_NEED_SAVE_MSIX_MESSAGES)
@@ -1244,7 +1247,7 @@ struct efx_nic_errors {
 	atomic_t tx_desc_fetch;
 	atomic_t spurious_tx;
 
-#ifdef CONFIG_SFC_DEBUGFS
+#ifdef CONFIG_DEBUG_FS
 	struct dentry *debug_dir;
 #endif
 };
@@ -1399,6 +1402,7 @@ struct efx_mae;
  * @type: Controller type attributes
  * @mgmt_dev: vDPA Management device
  * @port_num: Port number as reported by MCDI
+ * @client_id: client ID of this PCIe function
  * @adapter_base_addr: MAC address of port0 (used as unique identifier)
  * @reset_work: Scheduled reset workitem
  * @membase_phys: Memory BAR value as physical address
@@ -1510,6 +1514,8 @@ struct efx_mae;
  *	field of %MC_CMD_GET_CAPABILITIES_V4 response, or %MC_CMD_MAC_NSTATS)
  * @stats_period_ms: Interval between statistic updates in milliseconds.
  *	Set from ethtool -C parameter stats-block-usecs.
+ * @stats_monitor_work: Work item to monitor periodic statistics updates
+ * @stats_monitor_generation: Periodic stats most recent generation count
  * @stats_buffer: DMA buffer for statistics
  * @mc_initial_stats: Buffer for statistics as they were when probing the device
  * @rx_nodesc_drops_total: Count packets dropped when no RX descriptor is
@@ -1579,7 +1585,6 @@ struct efx_mae;
  *	and must be released by caller after statistics processing/copying
  *	if required.
  * @n_rx_noskb_drops: Count of RX packets dropped due to failure to allocate an skb
- * @debugfs_symlink_mutex: Mutex to protect access to debugfs symlinks.
  *
  * This is stored in the private area of the &struct net_device.
  */
@@ -1593,6 +1598,7 @@ struct efx_nic {
 	struct vdpa_mgmt_dev *mgmt_dev;
 #endif
 	unsigned int port_num;
+	u32 client_id;
 	/* Aligned for efx_mcdi_get_board_cfg()+ether_addr_copy() */
 	u8 adapter_base_addr[ETH_ALEN] __aligned(2);
 	struct work_struct reset_work;
@@ -1773,6 +1779,9 @@ struct efx_nic {
 	u16 num_mac_stats;
 	unsigned int stats_period_ms;
 
+	struct delayed_work stats_monitor_work;
+	__le64 stats_monitor_generation;
+
 	struct efx_buffer stats_buffer;
 	__le64 *mc_initial_stats;
 	u64 rx_nodesc_drops_total;
@@ -1839,7 +1848,7 @@ struct efx_nic {
 #endif
 #endif
 
-#ifdef CONFIG_SFC_DEBUGFS
+#ifdef CONFIG_DEBUG_FS
 	/** @debug_dir: NIC debugfs directory */
 	struct dentry *debug_dir;
 	/** @debug_symlink: NIC debugfs symlink (``nic_eth%d``) */
@@ -1878,6 +1887,8 @@ struct efx_nic {
 #if !defined(EFX_USE_KCOMPAT) || defined(EFX_USE_DEVLINK)
 	/** @devlink: Devlink instance */
 	struct devlink *devlink;
+	/** @devlink_port: Devlink port instance */
+	struct devlink_port *devlink_port;
 #endif
 	unsigned int mem_bar;
 	u32 reg_base;
@@ -1906,7 +1917,7 @@ struct efx_nic {
 	bool forward_fcs;
 #endif
 
-#ifdef CONFIG_SFC_DEBUGFS
+#ifdef CONFIG_DEBUG_FS
 	/**
 	 * @debugfs_symlink_mutex: Protect debugfs @debug_symlink and
 	 *	@debug_port_symlink

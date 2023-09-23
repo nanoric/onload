@@ -23,6 +23,7 @@ Build requirements
  * libcap-devel
  * libmnl-devel
  * perl-Test-Harness
+ * gcc-c++ or g++
 
 
  You will also need to install the kernel and its development headers (i.e. kernel
@@ -146,3 +147,8 @@ Installing from repository
  OR
 
     scripts/onload <app>
+
+Copyright
+=========
+
+This file: (c) Copyright 2020,2023 Xilinx, Inc.

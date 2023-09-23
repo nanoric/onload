@@ -133,7 +133,42 @@ extern void efct_vi_rxpkt_release(struct ef_vi* vi, uint32_t pkt_id);
 ** To await the specific completion event related to this packet use
 ** \a efct_vi_rx_future_poll rather than \a ef_eventq_poll.
 **
-** This function can be called concurrently with other APIs.
+** \note The ef_vi library must occasionally perform non-packet related work.
+** If such work is pending this function will always return NULL. The caller
+** must sometimes call \a ef_eventq_has_event in their busy-wait loop and
+** process events using \a ef_eventq_poll if any are indicated as waiting.
+**
+** \note An outline code structure for a busy-wait loop using
+** \a efct_vi_rx_future_peek is suggested below.
+** ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~{.c}
+** for ( ; ; ) {
+**   if ( (p = efct_vi_rx_future_peek(vi)) ) {
+**     // Process partial packet data here
+**     // ...
+**
+**     // Wait for full packet to arrive. rx_evs[0] will relate to
+**     // packet data just processed.
+**     while ( !(n_evs = efct_vi_rx_future_poll(vi, rx_evs, max_rx_evs)) )
+**       // Add timeout processing in this loop to cover rare event such as
+**       // hardware failure.
+**       ;
+**
+**     // Handle RX events returned. If rx_evs[0] is EF_EVENT_TYPE_RX_REF_DISCARD
+**     // undo packet processing.  Also undo packet processing if above loop
+**     // exited with no events.
+**     // ...
+**   }
+**   if (ef_eventq_has_event(vi)) {
+**     n_evs = ef_eventq_poll(vi, evs, max_evs);
+**     // Handle events returned.
+**     // ...
+**   }
+** }
+** ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+**
+** \par
+** \note \a efct_vi_rx_future_peek can be called concurrently with other APIs.
+** However, \a efct_vi_rx_future_poll and \a ef_eventq_poll cannot be.
 */
 extern const void* efct_vi_rx_future_peek(struct ef_vi* vi);
 
@@ -163,6 +198,26 @@ int efct_vi_rx_future_poll(ef_vi* vi, ef_event* evs, int evs_len);
 ** gives undefined behaviour.
 */
 #define EFCT_FUTURE_VALID_BYTES 62
+
+/*! \brief Start transmit warming for this VI
+**
+** Calling transmit functions during warming will exercise the code path but
+** will not send any data on the wire. This can potentially improve transmit
+** performance for packets sent in shortly after warming.
+**
+** Each warming transmit will generate a completion event of type
+** EF_EVENT_TYPE_TX with an invalid dma_id field of EF_REQUEST_ID_MASK.
+** There will be no timestamp whether or not transmit timestamping is
+** enabled for this VI.
+*/
+void efct_vi_start_transmit_warm(ef_vi* vi);
+
+/*! \brief Stop transmit warming for this VI
+**
+** Transmit functions will behave normally, attempting to send data on the
+** wire, after warming has been stopped.
+*/
+void efct_vi_stop_transmit_warm(ef_vi* vi);
 
 #ifdef __cplusplus
 }

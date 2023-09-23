@@ -739,12 +739,9 @@ typedef struct {
   ci_iptime_t tconst_pmtu_discover_recover;
 #define CI_PMTU_TCONST_DISCOVER_RECOVER (30*1000)
 
-  /* RFC 5961: limit for challenge ack packets per tick,
-   * derived from NI_OPTS(netif).challenge_ack_limit. */
-  ci_uint32 tconst_challenge_ack_limit;
-
   /* Rate limit for ACKs sent in response to invalid TCP packets,
-   * time period in ticks. */
+   * time period in ticks.
+   * It is used to limit challenge ACKs from RFC 5961 as well. */
   ci_iptime_t tconst_invalid_ack_ratelimit;
 
   /* Maximum time to defer a packet with unresolved MAC. */
@@ -871,7 +868,7 @@ typedef struct {
   oo_pkt_p              free;   /**< List of free packet buffers */
   ci_int32              n_free; /**< Number of buffers in free list */
 #if defined(CI_CFG_PKTS_AS_HUGE_PAGES)
-  CI_ULCONST ci_int32   shm_id; /**< shared memory id for huge page  */
+  CI_ULCONST ci_int64   page_offset;
 #endif
   CI_ULCONST ci_uint32  dma_addr_base; /**< Index into ci_netif::dma_addrs */
   ci_uint8              page_order; /**< Bitshift to get from packet ID to the
@@ -1233,10 +1230,14 @@ struct ci_netif_state_s {
   /* Set if one or more descriptor rings is getting low on buffers. */
   ci_int32              rxq_low;
 
-  /* The currently enforced RXQ limit.  Usually this is the same as the
-   * rxq_limit config option, but can be reduced when suffering memory
-   * pressure.
-   */
+  /* The usual value of rxq_limit, based on EF_RXQ_LIMIT but subject
+   * to various constraints applied during initialisation. This value does
+   * not change; always use rxq_limit for the currently enforced limit
+   * which may be reduced while suffering memory pressure. */
+  ci_int32              rxq_base_limit;
+
+  /* The currently enforced RXQ limit.  Usually this is the same as
+   * rxq_base_limit but can be reduced when suffering memory pressure. */
   ci_int32              rxq_limit;
 
   /* Set when we're short of packet buffers in the RX rings. */
@@ -1297,10 +1298,6 @@ struct ci_netif_state_s {
 
   /* List of sockets that may have reapable buffers. */
   struct oo_p_dllink        reap_list;
-
-  /* RFC 5961: limit the number of challenge ACKs */
-  ci_uint32     challenge_ack_num;
-  ci_iptime_t   challenge_ack_time;
 
 #if CI_CFG_SUPPORT_STATS_COLLECTION
   ci_int32              stats_fmt; /**< Output format */
@@ -2079,7 +2076,10 @@ struct ci_sock_cmn_s {
    * to give them back to getsockopt regardless of what we support
    */
   ci_uint32             timestamping_flags;
-  ci_uint32             ts_key;           /**< TIMESTAMPING_OPT_ID key */
+  ci_uint32             ts_key;           /**< TIMESTAMPING_OPT_ID key for UDP
+                                           *   For TCP this is the initial
+                                           *   sequence number.
+                                           */
 #endif
 
   /* This uid is in the scope of the user_namespace of the stack.  It is

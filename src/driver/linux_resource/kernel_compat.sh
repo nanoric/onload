@@ -66,6 +66,7 @@ EFRM_GUP_RCLONG_TASK_SEPARATEFLAGS symtype get_user_pages include/linux/mm.h lon
 EFRM_GUP_RCLONG_TASK_COMBINEDFLAGS symtype get_user_pages include/linux/mm.h long(struct task_struct *, struct mm_struct *, unsigned long, unsigned long, unsigned int, struct page **, struct vm_area_struct **)
 EFRM_GUP_RCLONG_NOTASK_COMBINEDFLAGS symtype get_user_pages include/linux/mm.h long(unsigned long, unsigned long, unsigned int, struct page **, struct vm_area_struct **)
 EFRM_GUP_HAS_PIN	symbol	pin_user_pages	include/linux/mm.h
+EFRM_GUP_HAS_DMA_PINNED	symbol	page_maybe_dma_pinned	include/linux/mm.h
 
 EFRM_HAVE_USERMODEHELPER_SETUP		symbol	call_usermodehelper_setup	include/linux/kmod.h
 EFRM_HAVE_USERMODEHELPER_SETUP_INFO	symtype	call_usermodehelper_setup	include/linux/kmod.h	struct subprocess_info*(char *path, char **argv, char **envp, gfp_t gfp_mask, int (*init)(struct subprocess_info *info, struct cred *new), void (*cleanup)(struct subprocess_info *), void *data)
@@ -142,20 +143,34 @@ EFRM_HAS_FLUSH_DELAYED_FPUT	export	flush_delayed_fput	include/linux/file.h	fs/fi
 
 EFRM_IRQ_FREE_RETURNS_NAME	symtype	free_irq	include/linux/interrupt.h void *(unsigned int, void *)
 
-EFRM_HAS_ITER_TYPE	memtype	struct_iov_iter	iter_type	include/linux/uio.h	u8
-
 EFRM_HAS_LINUX_STDARG_H			file	include/linux/stdarg.h
-EFRM_HAS_AUXBUS_H			file	include/linux/auxiliary_bus.h
-EFRM_HAS_MOD_DT_AUXBUS_H		file	include/linux/mod_devicetable_auxiliary.h
-EFRM_HAS_XLNX_EFCT_H			file	include/linux/net/xilinx/xlnx_efct.h
 EFRM_TASK_HAS_CPUMASK		member	struct_task_struct	cpus_mask	include/linux/sched.h
 
 EFRM_HAVE_LOWCASE_PDE_DATA symbol pde_data include/linux/proc_fs.h
 EFRM_HAVE_NETIF_RX_NI symbol netif_rx_ni include/linux/netdevice.h
 
 EFRM_HAVE_MODULE_MUTEX		symbol	module_mutex	include/linux/module.h
+EFRM_HAVE_ITER_UBUF symbol ITER_UBUF include/linux/uio.h
+
+EFRM_HAVE_FLOW_RSS      symbol  FLOW_RSS    include/uapi/linux/ethtool.h
+
+EFRM_CLASS_DEVNODE_DEV_IS_CONST memtype struct_class devnode include/linux/device/class.h char*(*)(const struct device *, umode_t *)
+EFRM_CLASS_DEVNODE_DEV_IS_CONST memtype struct_class devnode include/linux/device.h char*(*)(const struct device *, umode_t *)
+
+EFRM_HAVE_VM_FLAGS_SET symbol vm_flags_set include/linux/mm.h
+
+EFRM_HAVE_GET_RANDOM_U32	symbol get_random_u32	include/linux/random.h
+
+EFRM_HUGETLB_FILE_SETUP		symtype	hugetlb_file_setup	include/linux/hugetlb.h	struct file *(const char *, size_t, vm_flags_t, int, int)
+EFRM_HUGETLB_FILE_SETUP_UCOUNTS	symtype	hugetlb_file_setup	include/linux/hugetlb.h	struct file *(const char *, size_t, vm_flags_t, struct ucounts **, int, int)
+EFRM_HUGETLB_FILE_SETUP_USER	symtype	hugetlb_file_setup	include/linux/hugetlb.h	struct file *(const char *, size_t, vm_flags_t, struct user_struct**, int, int)
+
+EFRM_CLASS_CREATE_NO_MODULE symtype class_create include/linux/device/class.h struct class *(const char *)
+
+EFRM_HAVE_ITER_IOV symbol iter_iov include/linux/uio.h
+
 # TODO move onload-related stuff from net kernel_compat
-" | egrep -v -e '^#' -e '^$' | sed 's/[ \t][ \t]*/:/g'
+" | grep -E -v -e '^#' -e '^$' | sed 's/[ \t][ \t]*/:/g'
 }
 
 ######################################################################

@@ -19,6 +19,7 @@
 #include <linux/spinlock.h>
 #include <linux/rtnetlink.h>
 #include <linux/slab.h>
+#include <linux/debugfs.h>
 #ifdef EFX_HAVE_STRUCT_SIZE
 #include <linux/overflow.h>
 #endif
@@ -29,10 +30,6 @@
 #endif
 #if defined(EFX_NEED_HWMON_DEVICE_REGISTER_WITH_INFO)
 #include <linux/hwmon.h>
-#endif
-#ifdef EFX_NEED_HASH_64
-#include <asm/types.h>
-#include <linux/compiler.h>
 #endif
 #ifdef EFX_TC_OFFLOAD
 #ifndef EFX_HAVE_TC_FLOW_OFFLOAD
@@ -349,50 +346,6 @@ struct device *hwmon_device_register_with_info(
 	const struct attribute_group **extra_groups __always_unused)
 {
 	return hwmon_device_register(dev);
-}
-#endif
-
-#ifdef EFX_NEED_HASH_64
-/* 2^31 + 2^29 - 2^25 + 2^22 - 2^19 - 2^16 + 1 */
-#define GOLDEN_RATIO_PRIME_32 0x9e370001UL
-/*  2^63 + 2^61 - 2^57 + 2^54 - 2^51 - 2^18 + 1 */
-#define GOLDEN_RATIO_PRIME_64 0x9e37fffffffc0001UL
-
-#if BITS_PER_LONG == 32
-#define GOLDEN_RATIO_PRIME GOLDEN_RATIO_PRIME_32
-#define hash_long(val, bits) hash_32(val, bits)
-#elif BITS_PER_LONG == 64
-#define hash_long(val, bits) hash_64(val, bits)
-#define GOLDEN_RATIO_PRIME GOLDEN_RATIO_PRIME_64
-#else
-#error Wordsize not 32 or 64
-#endif
-
-static __always_inline u64 hash_64(u64 val, unsigned int bits)
-{
-	u64 hash = val;
-
-#if defined(CONFIG_ARCH_HAS_FAST_MULTIPLIER) && BITS_PER_LONG == 64
-	hash = hash * GOLDEN_RATIO_PRIME_64;
-#else
-	/*  Sigh, gcc can't optimise this alone like it does for 32 bits. */
-	u64 n = hash;
-	n <<= 18;
-	hash -= n;
-	n <<= 33;
-	hash -= n;
-	n <<= 3;
-	hash += n;
-	n <<= 3;
-	hash -= n;
-	n <<= 4;
-	hash += n;
-	n <<= 2;
-	hash += n;
-#endif
-
-	/* High bits are more random, so use them. */
-	return hash >> (64 - bits);
 }
 #endif
 
@@ -786,3 +739,20 @@ int devlink_info_version_running_put(struct devlink_info_req *req,
 }
 
 #endif	/* !EFX_USE_DEVLINK */
+
+#ifdef CONFIG_DEBUG_FS
+void debugfs_lookup_and_remove(const char *name, struct dentry *dir)
+{
+	struct qstr child_name = QSTR_INIT(name, strlen(name));
+	struct dentry *child;
+
+	child = d_hash_and_lookup(dir, &child_name);
+	if (!IS_ERR_OR_NULL(child)) {
+		/* If it's a "regular" file, free its parameter binding */
+		if (S_ISREG(child->d_inode->i_mode))
+			kfree(child->d_inode->i_private);
+		debugfs_remove(child);
+		dput(child);
+	}
+}
+#endif	/* CONFIG_DEBUGFS */

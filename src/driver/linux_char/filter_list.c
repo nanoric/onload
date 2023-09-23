@@ -158,7 +158,15 @@ static int efch_filter_insert(struct efrm_resource *rs, struct efrm_pd *pd,
                               struct efx_filter_spec *spec, struct filter *f,
                               unsigned flags)
 {
-  int rc = efrm_filter_insert(rs->rs_client, spec, &f->rxq, NULL, flags);
+  int rc;
+  /* This is the default exclusive token for non-exclusive applications.
+   * By doing so, we can ensure queues that are already non-exclusive
+   * cannot be used for exclusive purposes. */
+  unsigned exclusive_rxq_token = EFHW_PD_NON_EXC_TOKEN;
+
+  if ( flags & EFHW_FILTER_F_EXCL_RXQ )
+    exclusive_rxq_token = efrm_pd_exclusive_rxq_token_get(pd);
+  rc = efrm_filter_insert(rs->rs_client, spec, &f->rxq, exclusive_rxq_token, NULL, flags);
   if( rc < 0 )
     return rc;
 
@@ -166,6 +174,21 @@ static int efch_filter_insert(struct efrm_resource *rs, struct efrm_pd *pd,
   f->flags |= FILTER_FLAGS_USES_EFRM_FILTER;
 
   return rc;
+}
+
+
+static unsigned filter_flags_to_efhw_flags(unsigned filter_flags)
+{
+  unsigned efhw_flags = 0;
+
+  if( filter_flags & CI_FILTER_FLAG_PREF_RXQ )
+    efhw_flags |= EFHW_FILTER_F_PREF_RXQ;
+  if( filter_flags & CI_FILTER_FLAG_ANY_RXQ )
+    efhw_flags |= EFHW_FILTER_F_ANY_RXQ;
+  if( filter_flags & CI_FILTER_FLAG_EXCLUSIVE_RXQ )
+    efhw_flags |= EFHW_FILTER_F_EXCL_RXQ;
+
+  return efhw_flags;
 }
 
 
@@ -178,6 +201,7 @@ static int efch_filter_list_rsops_add(struct efrm_resource *rs,
   struct filter* f;
   int rc;
   int block_flags = 0;
+  unsigned flags = 0;
 
   if( (f = ci_alloc(sizeof(*f))) == NULL )
     return -ENOMEM;
@@ -210,8 +234,11 @@ static int efch_filter_list_rsops_add(struct efrm_resource *rs,
   }
 
   if( ! is_op_block_kernel_only(op->op) ) {
-    rc = efch_filter_insert(rs, pd, spec, f,
-                            replace ? EFHW_FILTER_F_REPLACE : 0);
+    flags |= filter_flags_to_efhw_flags(op->u.filter_add.u.in.flags);
+    if( replace )
+      flags |= EFHW_FILTER_F_REPLACE;
+
+    rc = efch_filter_insert(rs, pd, spec, f, flags);
     if( rc < 0 ) {
       efch_filter_delete(rs, pd, f);
       return rc;
@@ -388,6 +415,28 @@ int efch_filter_list_del(struct efrm_resource *rs, struct efrm_pd *pd,
 }
 
 
+static int efch_filter_list_query(struct efrm_resource *rs, struct efrm_pd *pd,
+                                  struct efch_filter_list *fl, int filter_id,
+                                  int *rxq, int *hw_id, int* flags)
+{
+  struct filter* f;
+  int rc = -EINVAL;
+
+  spin_lock(&fl->lock);
+  CI_DLLIST_FOR_EACH2(struct filter, f, link, &fl->filters)
+    if( f->filter_id == filter_id ) {
+      rc = 0;
+      break;
+    }
+  spin_unlock(&fl->lock);
+
+  if( rc == 0 )
+    rc = efrm_filter_query(rs->rs_client, f->efrm_filter_id, rxq, hw_id, flags);
+
+  return rc;
+}
+
+
 int efch_filter_list_op_add(struct efrm_resource *rs, struct efrm_pd *pd,
                             struct efch_filter_list *fl, ci_resource_op_t *op,
                             int *copy_out, unsigned efx_filter_flags,
@@ -510,6 +559,14 @@ int efch_filter_list_op_del(struct efrm_resource *rs, struct efrm_pd *pd,
   return efch_filter_list_del(rs, pd, fl, op->u.filter_del.filter_id);
 }
 
+int efch_filter_list_op_query(struct efrm_resource *rs, struct efrm_pd *pd,
+                              struct efch_filter_list *fl, ci_resource_op_t *op)
+{
+  return efch_filter_list_query(rs, pd, fl, op->u.filter_query.filter_id,
+                                &op->u.filter_query.out_rxq,
+                                &op->u.filter_query.out_hw_id,
+                                &op->u.filter_query.out_flags);
+}
 
 int efch_filter_list_op_block(struct efrm_resource *rs, struct efrm_pd *pd,
                               struct efch_filter_list *fl,
@@ -630,19 +687,11 @@ int efch_filter_list_add(struct efrm_resource *rs, struct efrm_pd *pd,
   f->flags = 0;
   f->rxq = -1;
 
-  /* EFCT TODO: this EXCLUSIVE_RXQ flag conversion works for apps having only
-   * one filter (e.g. eflatency) but needs to be smarter to go beyond that */
-  if ( filter_add->in.flags & CI_FILTER_FLAG_EXCLUSIVE_RXQ ) {
-    onload_filter_flags |= EFHW_FILTER_F_EXCL_RXQ;
-    onload_filter_flags |= EFHW_FILTER_F_ANY_RXQ;
-  } 
-  
+
   if( filter_add->in.fields & CI_FILTER_FIELD_RXQ )
     f->rxq = filter_add->in.rxq_no;
-  if( filter_add->in.flags & CI_FILTER_FLAG_PREF_RXQ )
-    onload_filter_flags |= EFHW_FILTER_F_PREF_RXQ;
-  if( filter_add->in.flags & CI_FILTER_FLAG_ANY_RXQ )
-    onload_filter_flags |= EFHW_FILTER_F_ANY_RXQ;
+
+  onload_filter_flags |= filter_flags_to_efhw_flags(filter_add->in.flags);
 
   rc = efch_filter_insert(rs, pd, &spec, f, onload_filter_flags);
 
@@ -667,5 +716,6 @@ int efch_filter_list_add(struct efrm_resource *rs, struct efrm_pd *pd,
   filter_add->out.out_len = sizeof(filter_add->out);
   filter_add->out.filter_id = f->filter_id;
   filter_add->out.rxq = f->rxq;
+ 
   return 0;
 }

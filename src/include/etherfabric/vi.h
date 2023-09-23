@@ -439,6 +439,46 @@ enum ef_filter_flags {
   /** If set, the filter will receive looped back packets for matching (see
   ** ef_filter_spec_set_tx_port_sniff()) */
   EF_FILTER_FLAG_MCAST_LOOP_RECEIVE     = 0x2,
+  /** The flag below is intended to be used by the ef_filter_spec_init() function.
+  **
+  **  If set, this will attempt to reserve the use of a hardware receive_queue for a
+  **  singular application. This is useful only for X3 supported hardware as
+  **  other cards do not use shared queues.
+  **
+  **  Exclusivity is defined by the following properties:
+  **    1) Other applications will be unable to snoop on traffic filtered to this
+  **       application.
+  **    2) This application can guarantee that it will not receive any packets
+  **       for which it did not explicitly add a filter.
+  **
+  **  If no free hardware queues are currently available then the filter addition
+  **  will fail. Exclusivity is reserved from hardware_queue 1+, the default
+  **  0th queue cannot be exclusively owned.
+  **
+  **  Subsequent filters added by the same application, with or without the
+  **  exclusive flag, may use the exclusive queue. Filters added by other
+  **  applications will not be able to use the queue.
+  **
+  **  If an application has already added at least one filter to a VI without
+  **  using the exclusive flag then a subsequent filter using the flag will not
+  **  be able to 'upgrade' the existing hardware queue to be exclusive: another
+  **  hardware queue will be allocated and associated with the VI. This may not
+  **  be the most efficient way to organise the system.
+  **
+  **  Similarly, it is not possible to 'downgrade' an exclusivity owned queue
+  **  whilst an exclusive filter is in place. As such, all subsequent filter
+  **  insertions to the same queue, should use the exclusivity flag.
+  **
+  **  If a multicast stream is required by multiple applications and one
+  **  application has added it to an exclusive queue of their own then all
+  **  subsequent applications attempting to listen to that multicast stream will
+  **  fail since they cannot share the queue.
+  **
+  **  Filters inserted externally to onload via ethtool can bypass the above
+  **  exclusivity restrictions.
+  **
+  */
+  EF_FILTER_FLAG_EXCLUSIVE_RXQ     = 0x4,
 };
 
 /*! \brief Specification of a filter */
@@ -1007,6 +1047,76 @@ extern int ef_vi_filter_add(ef_vi* vi, ef_driver_handle vi_dh,
 */
 extern int ef_vi_filter_del(ef_vi* vi, ef_driver_handle vi_dh,
                             ef_filter_cookie* filter_cookie);
+
+
+/*! \brief Values for the ef_filter_info::valid_fields bitmask */
+enum ef_filter_info_fields {
+  /*! The ef_filter_info::filter_id field has a valid value */
+  EF_FILTER_FIELD_ID    = 0x0001,
+  /*! The ef_filter_info::q_id field has a valid value */
+  EF_FILTER_FIELD_QUEUE = 0x0002,
+};
+
+/*! \brief Flags set for the ef_filter_info::flags bitmask */
+enum ef_filter_info_flags {
+  /*! The inserted filter has been marked as exclusive under the conditions
+   ** defined by EF_FILTER_FLAG_EXCLUSIVE_RXQ.
+   */
+  EF_FILTER_IS_EXCLUSIVE = 0x0004
+};
+
+/*! \brief Output information from the ef_vi_filter_query() function */
+typedef struct ef_filter_info {
+  /*! A bitmask of ef_filter_info_fields values indicating which of the
+  ** following fields in this structure has a valid value.
+  **
+  ** For a specific filter, the validity of a field may depend on any of the
+  ** type of NIC used, the type of the filter, the amount of free hardware
+  ** resources at the time the filter was added, or the configuration of the
+  ** VI.
+  */
+  uint64_t valid_fields;
+  /*! Bitmask of additional flags about the filter that describe properties
+   ** of a given filter.
+   **
+   ** For further detail on these properties, please see ef_filter_info_flags.
+   */
+  unsigned flags;
+  /*! A hardware-assigned unique identifier of this filter, which may be
+  ** available in a \p filter_id field of an \p ef_event. If this field is
+  ** valid, this may be used by applications to determine when a specific
+  ** filter has been matched and hence allow the software to skip some amount
+  ** of packet validation and dispatch.
+  */
+  unsigned filter_id;
+  /*! The hardware queue identifier on which the filter was added. This matches
+  ** the \p q_id field of an \p ef_event, allowing an application to query
+  ** details of how the filter arbitrator has handled this filter request.
+  */
+  unsigned q_id;
+} ef_filter_info;
+
+/*! \brief Returns information about how a filter insertion request was mapped
+** on to the NIC hardware.
+**
+** \param vi               The virtual interface on which the filter was added.
+** \param vi_dh            The ef_driver_handle for the virtual interface.
+** \param filter_cookie    The filter cookie for the filter to query, as set
+**                         on return from ef_vi_filter_add().
+** \param filter_info      Output value to contain the information queried.
+** \param filter_info_size To be populated with \p sizeof(filter_info) by the
+**                         application, to allow for forward-compatibility.
+**
+** \return 0 on success, or a negative error code.
+**
+** In the returned \param filter_info, only the \p valid_fields member is
+** guaranteed to be populated. All other fields may not be meaningful for this
+** particular filter.
+*/
+extern int ef_vi_filter_query(ef_vi* vi, ef_driver_handle vi_dh,
+                              const ef_filter_cookie* filter_cookie,
+                              ef_filter_info* filter_info,
+                              size_t filter_info_size);
 
 
 /*! \brief Add a filter to a virtual interface set.

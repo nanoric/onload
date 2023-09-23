@@ -72,6 +72,10 @@ struct efrm_pd_owner_ids;
 #define EFRM_PD_ALLOC_FLAG_WITH_CLIENT_ID 0x4
 /* Try again without client IDs if the hardware fails it */
 #define EFRM_PD_ALLOC_FLAG_WITH_CLIENT_ID_OPT 0x8
+/*   EFRM_PD_ALLOC_CLUSTER indicates this pd will be used for a vi set. This
+ *       is only relevant for certain NIC HW.
+ */
+#define EFRM_PD_ALLOC_CLUSTER 0x10
 
 /* Allocate a protection domain.
  *
@@ -137,19 +141,15 @@ efrm_pd_set_min_align(struct efrm_pd *pd, int alignment);
 extern int
 efrm_pd_get_min_align(struct efrm_pd *pd);
 
+extern unsigned
+efrm_pd_exclusive_rxq_token_get(struct efrm_pd *pd);
+
 /* Returns the NIC's dynamic client entity grouping everything in this PD
  * together */
 extern uint32_t
 efrm_pd_get_nic_client_id(struct efrm_pd *pd);
 
 #define EFRM_NIC_CLIENT_ID_NONE (~0u)
-
-/* Return true if a mapping to one protection domain may be re-used by
- * another.  It happens when:
- * - DMA map is the same (for example, same IOMMU domain);
- * - buffer table is not used (physicall address mode).
- */
-int efrm_pd_share_dma_mapping(struct efrm_pd *pd, struct efrm_pd *pd1);
 
 /* Return true if this PD is using a non-default vport. */
 extern int

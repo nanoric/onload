@@ -50,6 +50,7 @@
 #include "tcp_helper_stats_dump.h"
 #include <onload/tcp-ceph.h>
 #include <onload/tx_plugin.h>
+#include <kernel_utils/hugetlb.h>
 
 #ifdef NDEBUG
 # define DEBUG_STR  ""
@@ -998,11 +999,11 @@ int tcp_helper_post_filter_add(tcp_helper_resource_t* trs, int hwport,
     if( qix == -EALREADY )
       return 0;
 
-    rc = efrm_rxq_alloc(vi_rs, rxq, qix, true, hugepages,
-                        trs->thc_efct_memfd, &trs->thc_efct_memfd_off,
+    rc = efrm_rxq_alloc(vi_rs, rxq, qix, true, hugepages, trs->thc_efct_alloc,
                         &trs->nic[intf_i].thn_efct_rxq[qix]);
     if( rc < 0 ) {
-      ci_log("%s: ERROR: efrm_rxq_alloc failed (%d)\n", __func__, rc);
+      if( rc != -EINTR )
+        ci_log("%s: ERROR: efrm_rxq_alloc failed (%d)", __func__, rc);
       return rc;
     }
     efct_vi_start_rxq(vi, qix);
@@ -1213,7 +1214,16 @@ static int allocate_pd(ci_netif* ni, struct vi_allocate_info* info,
     return rc;
   }
 
-  if( info->cluster == NULL ) {
+  if( info->cluster ) {
+    int hwport = ni->intf_i_to_hwport[info->intf_i];
+    ci_assert_ge(hwport, 0);
+    info->vi_set = info->cluster->thc_vi_set[hwport];
+  }
+  else {
+    info->vi_set = NULL;
+  }
+
+  if( info->cluster == NULL || !(nic->flags & NIC_FLAG_SHARED_PD) ) {
     rc = efrm_pd_alloc(&info->pd, info->client,
         ((info->ef_vi_flags & EF_VI_RX_PHYS_ADDR) ?
             EFRM_PD_ALLOC_FLAG_PHYS_ADDR_MODE : 0) |
@@ -1226,12 +1236,8 @@ static int allocate_pd(ci_netif* ni, struct vi_allocate_info* info,
     }
     ci_assert(info->pd);
     info->release_pd = 1;
-    info->vi_set = NULL;
   }
   else {
-    int hwport = ni->intf_i_to_hwport[info->intf_i];
-    ci_assert_ge(hwport, 0);
-    info->vi_set = info->cluster->thc_vi_set[hwport];
     info->release_pd = 0;
     info->pd = efrm_vi_set_get_pd(info->vi_set);
   }
@@ -1569,8 +1575,7 @@ static int tcp_helper_superbuf_config_refresh(ef_vi* vi, int qid)
 
 static int initialise_vi(ci_netif* ni, struct ef_vi* vi, struct efrm_vi* vi_rs,
                          struct efrm_vi_mappings* vm, void* vi_state,
-                         int vi_arch, int vi_variant, int vi_revision,
-                         unsigned char vi_nic_flags,
+                         struct efhw_nic* nic,
                          struct vi_allocate_info* alloc_info,
                          unsigned* vi_out_flags, ef_vi_stats* vi_stats)
 {
@@ -1578,8 +1583,9 @@ static int initialise_vi(ci_netif* ni, struct ef_vi* vi, struct efrm_vi* vi_rs,
 
   efrm_vi_get_mappings(vi_rs, vm);
 
-  ef_vi_init(vi, vi_arch, vi_variant, vi_revision, alloc_info->ef_vi_flags,
-             vi_nic_flags, (ef_vi_state*) vi_state);
+  ef_vi_init(vi, nic->devtype.arch, nic->devtype.variant, nic->devtype.revision,
+             alloc_info->ef_vi_flags, efhw_vi_nic_flags(nic),
+             (ef_vi_state*) vi_state);
   *vi_out_flags = (vm->out_flags & EFHW_VI_CLOCK_SYNC_STATUS) ?
                         EF_VI_OUT_CLOCK_SYNC_STATUS : 0;
 
@@ -1602,6 +1608,16 @@ static int initialise_vi(ci_netif* ni, struct ef_vi* vi, struct efrm_vi* vi_rs,
     ef_vi_init_txq(vi, vm->txq_size, vm->txq_descriptors, vi_ids);
   vi->vi_i = EFAB_VI_RESOURCE_INSTANCE(vi_rs);
   vi->dh = efrm_client_get_nic(vi_rs->rs.rs_client);
+  if( vi->internal_ops.design_parameters ) {
+    int rc;
+    struct efab_nic_design_parameters dp = EFAB_NIC_DP_INITIALIZER;
+    rc = efhw_nic_design_parameters(nic, &dp);
+    if( rc < 0 )
+      return rc;
+    rc = vi->internal_ops.design_parameters(vi, &dp);
+    if( rc < 0 )
+      return rc;
+  }
   if( vi->max_efct_rxq ) {
     int i;
     int rc = efct_vi_mmap_init_internal(vi, vi_rs->efct_shm);
@@ -1621,6 +1637,17 @@ static int initialise_vi(ci_netif* ni, struct ef_vi* vi, struct efrm_vi* vi_rs,
   ef_vi_set_ts_format(vi, vm->ts_format);
   ef_vi_init_rx_timestamping(vi, vm->rx_ts_correction);
   ef_vi_init_tx_timestamping(vi, vm->tx_ts_correction);
+  ef_vi_receive_set_discards(vi,
+      EF_VI_DISCARD_RX_L4_CSUM_ERR |
+      EF_VI_DISCARD_RX_L3_CSUM_ERR |
+      EF_VI_DISCARD_RX_ETH_FCS_ERR |
+      EF_VI_DISCARD_RX_ETH_LEN_ERR |
+      EF_VI_DISCARD_RX_INNER_L3_CSUM_ERR |
+      EF_VI_DISCARD_RX_INNER_L4_CSUM_ERR |
+      EF_VI_DISCARD_RX_L2_CLASS_OTHER |
+      EF_VI_DISCARD_RX_L3_CLASS_OTHER |
+      EF_VI_DISCARD_RX_L4_CLASS_OTHER 
+  );
   return 0;
 }
 
@@ -1764,9 +1791,7 @@ static int allocate_vis(tcp_helper_resource_t* trs,
     }
 
     vi = ci_netif_vi(ni, intf_i);
-    rc = initialise_vi(ni, vi, tcp_helper_vi(trs, intf_i), vm,
-                       vi_state, nic->devtype.arch, nic->devtype.variant,
-                       nic->devtype.revision, efhw_vi_nic_flags(nic),
+    rc = initialise_vi(ni, vi, tcp_helper_vi(trs, intf_i), vm, vi_state, nic,
                        &alloc_info, &vi_out_flags, &ni->state->vi_stats);
     if( rc < 0 )
       goto error_out;
@@ -1880,9 +1905,7 @@ static int allocate_vis(tcp_helper_resource_t* trs,
         }
         vi_rs = trs_nic->thn_vi_rs[vi_i];
         rc = initialise_vi(ni, &ni->nic_hw[intf_i].vis[vi_i],
-                           vi_rs, vm,
-                           vi_state, nic->devtype.arch, nic->devtype.variant,
-                           nic->devtype.revision, efhw_vi_nic_flags(nic),
+                           vi_rs, vm, vi_state, nic,
                            &alloc_info, &vi_out_flags, &ni->state->vi_stats);
         if( rc < 0 ) {
           if( release_pd )
@@ -2523,9 +2546,9 @@ allocate_netif_resources(ci_resource_onload_alloc_t* alloc,
   /* The shared netif-state buffer and EP buffers are part of the mem mmap */
   trs->mem_mmap_bytes += ns->netif_mmap_bytes;
   OO_DEBUG_MEMSIZE(ci_log(
-	"added %d (0x%x) bytes for shared netif state and ep buffers, "
-	"reached %d (0x%x)", ns->netif_mmap_bytes, ns->netif_mmap_bytes,
-	trs->mem_mmap_bytes, trs->mem_mmap_bytes));
+        "added %d (0x%x) bytes for shared netif state and ep buffers, "
+        "reached %d (0x%x)", ns->netif_mmap_bytes, ns->netif_mmap_bytes,
+        trs->mem_mmap_bytes, trs->mem_mmap_bytes));
 
   if( trs->name[0] == '\0' )
     snprintf(ns->pretty_name, sizeof(ns->pretty_name), "%d", ns->stack_id);
@@ -2831,7 +2854,7 @@ allocate_netif_hw_resources(ci_resource_onload_alloc_t* alloc,
 
   OO_DEBUG_SHM(ci_log("%s:", __func__));
 
-  if( NI_OPTS(ni).prealloc_packets && trs->thc_efct_memfd ) {
+  if( NI_OPTS(ni).prealloc_packets && trs->thc_efct_alloc ) {
     int n_rxqs = 0;
     OO_STACK_FOR_EACH_INTF_I(ni, intf_i) {
       struct efhw_nic* nic =
@@ -2839,8 +2862,8 @@ allocate_netif_hw_resources(ci_resource_onload_alloc_t* alloc,
       n_rxqs += efhw_nic_max_shared_rxqs(nic);
     }
     if( n_rxqs ) {
-      off_t bytes = CI_HUGEPAGE_SIZE * EFCT_HUGEPAGES_PER_RXQ * n_rxqs;
-      rc = vfs_fallocate(trs->thc_efct_memfd, 0, 0, bytes);
+      int nr_pages = EFCT_HUGEPAGES_PER_RXQ * n_rxqs;
+      rc = oo_hugetlb_pages_prealloc(trs->thc_efct_alloc, nr_pages);
       if( rc < 0 ) {
         if( rc == -ENOSPC )
           OO_DEBUG_ERR(ci_log("tcp_helper_alloc: fallocate hugepage memory "
@@ -3098,6 +3121,9 @@ static int oo_get_nics(tcp_helper_resource_t* trs, int ifindices_len)
   efrm_nic_set_clear(&ni->nic_set);
   trs->netif.nic_n = 0;
 
+  if( NI_OPTS(ni).no_hw )
+    ifindices_len = 0;
+
   if( ifindices_len > CI_CFG_MAX_INTERFACES )
     return -E2BIG;
 
@@ -3177,7 +3203,7 @@ static int oo_get_nics(tcp_helper_resource_t* trs, int ifindices_len)
   if( trs->netif.nic_n == 0 && ifindices_len != 0 ) {
     ci_log("%s: ERROR: No Solarflare network interfaces are active/UP,\n"
            "or they are configured with packed stream firmware, disabled,\n"
-	   "or unlicensed for Onload. Please check your configuration.",
+           "or unlicensed for Onload. Please check your configuration.",
            __FUNCTION__);
     return -ENODEV;
   }
@@ -3446,6 +3472,7 @@ tcp_helper_rm_alloc_proxy(ci_resource_onload_alloc_t* alloc,
     rc = tcp_helper_cluster_alloc_thr(alloc->in_name,
                                       alloc->in_cluster_size,
                                       alloc->in_cluster_restart,
+                                      alloc->in_pktbuf_memfd,
                                       in_flags,
                                       opts,
                                       &rs);
@@ -4560,16 +4587,40 @@ int tcp_helper_rm_alloc(ci_resource_onload_alloc_t* alloc,
   ci_dllist_push(&THR_TABLE.started_stacks, &rs->all_stacks_link);
   ci_irqlock_unlock(&THR_TABLE.lock, &lock_flags);
 
-  rs->thc_efct_memfd = NULL;
-  rs->thc_efct_memfd_off = 0;
-  if( alloc->in_memfd >= 0 ) {
-    rs->thc_efct_memfd = fget(alloc->in_memfd);
-    if( ! rs->thc_efct_memfd ) {
-      rc = -EBADF;
-      OO_DEBUG_ERR(ci_log("%s: [%d] Bad fd for efct (%d).",
-                  __func__, NI_ID(ni), alloc->in_memfd));
-      goto fail_memfd;
+  rs->thc_efct_alloc = oo_hugetlb_allocator_create(alloc->in_efct_memfd);
+  if( IS_ERR(rs->thc_efct_alloc) ) {
+    long rc = PTR_ERR(rs->thc_efct_alloc);
+    rs->thc_efct_alloc = NULL;
+
+    OO_DEBUG_ERR(ci_log("%s: [%d] Unable to create EFCT hugetlb allocator "
+                        "(%ld).", __func__, NI_ID(ni), rc));
+
+    /* -EINVAL means we failed to pass the parameters around.
+     * Otherwise, we carry on but still may fail in EFCT that
+     * requires hugetlb support. */
+    if( rc == -EINVAL )
+      goto fail_efct_memfd;
+  }
+
+  if( thc && thc->thc_pktbuf_alloc ) {
+    rs->thc_pktbuf_alloc = oo_hugetlb_allocator_get(thc->thc_pktbuf_alloc);
+  } else {
+    rs->thc_pktbuf_alloc = oo_hugetlb_allocator_create(alloc->in_pktbuf_memfd);
+    if( IS_ERR(rs->thc_pktbuf_alloc) ) {
+      long rc = PTR_ERR(rs->thc_pktbuf_alloc);
+      rs->thc_pktbuf_alloc = NULL;
+
+      OO_DEBUG_ERR(ci_log("%s: [%d] Unable to create packet buffer hugetlb "
+                          "allocator (%ld).", __func__, NI_ID(ni), rc));
+
+      /* -EINVAL means we failed to pass the parameters around.
+       * Otherwise, we can carry on without hugepages. */
+      if( rc == -EINVAL )
+        goto fail_pktbuf_memfd;
     }
+
+    if( thc && rs->thc_pktbuf_alloc )
+      thc->thc_pktbuf_alloc = oo_hugetlb_allocator_get(rs->thc_pktbuf_alloc);
   }
 
   /* Allocate hardware resources */
@@ -4826,9 +4877,13 @@ int tcp_helper_rm_alloc(ci_resource_onload_alloc_t* alloc,
   tcp_helper_stop_periodic_work(rs);
 #endif
 
-  if( rs->thc_efct_memfd )
-    fput(rs->thc_efct_memfd);
- fail_memfd:
+  if( rs->thc_pktbuf_alloc )
+    oo_hugetlb_allocator_put(rs->thc_pktbuf_alloc);
+
+ fail_pktbuf_memfd:
+  if( rs->thc_efct_alloc )
+    oo_hugetlb_allocator_put(rs->thc_efct_alloc);
+ fail_efct_memfd:
 #if CI_CFG_NIC_RESET_SUPPORT
   destroy_workqueue(rs->reset_wq);
  fail5a:
@@ -5734,7 +5789,7 @@ efab_tcp_helper_rm_free_locked(tcp_helper_resource_t* trs)
  * (waiting for any running callbacks to complete)
  *
  * Split into a separate function from tcp_helper_dtor only to make the
- * protection against potentail race conditions clearer
+ * protection against potential race conditions clearer
  *
  * \param trs             TCP helper resource
  *
@@ -5761,7 +5816,7 @@ tcp_helper_stop(tcp_helper_resource_t* trs)
 
 #if ! CI_CFG_UL_INTERRUPT_HELPER
   /* stop postponed packet allocations: we are the only thread using this
-   * thr, so nobody can scedule anything new */
+   * thr, so nobody can schedule anything new */
   flush_workqueue(trs->wq);
 #endif
 #if CI_CFG_NIC_RESET_SUPPORT
@@ -5881,8 +5936,10 @@ void tcp_helper_dtor(tcp_helper_resource_t* trs)
 
   release_netif_hw_resources(trs);
   release_netif_resources(trs);
-  if( trs->thc_efct_memfd )
-    fput(trs->thc_efct_memfd);
+  if( trs->thc_pktbuf_alloc )
+    oo_hugetlb_allocator_put(trs->thc_pktbuf_alloc);
+  if( trs->thc_efct_alloc )
+    oo_hugetlb_allocator_put(trs->thc_efct_alloc);
 
 #if ! CI_CFG_UL_INTERRUPT_HELPER
   destroy_workqueue(trs->wq);
@@ -6198,7 +6255,7 @@ efab_tcp_helper_no_more_bufs(tcp_helper_resource_t* trs)
                  ci_log(FN_FMT "New limits: max_packets=%d rx=%d tx=%d "
                         "rxq_limit=%d", FN_PRI_ARGS(ni),
                         NI_OPTS(ni).max_packets, NI_OPTS(ni).max_rx_packets,
-                        NI_OPTS(ni).max_tx_packets, NI_OPTS(ni).rxq_limit));
+                        NI_OPTS(ni).max_tx_packets, ni->state->rxq_base_limit));
 }
 
 
@@ -6214,23 +6271,12 @@ efab_tcp_helper_iobufset_map(tcp_helper_resource_t* trs,
 {
   ci_netif* ni = &trs->netif;
   int rc, intf_i;
-  struct efrm_pd *first_pd = NULL;
-  struct oo_iobufset *first_iobuf = NULL;
   int map_order = INT_MAX;
 
   OO_STACK_FOR_EACH_INTF_I(ni, intf_i) {
     struct efrm_pd *pd = efrm_vi_get_pd(tcp_helper_vi(trs, intf_i));
     struct oo_iobufset *iobuf;
     int cur_map_order;
-
-    if( first_pd != NULL && efrm_pd_share_dma_mapping(first_pd, pd) ) {
-      ci_assert(first_iobuf);
-      all_out[intf_i] = first_iobuf;
-      o_iobufset_resource_ref(first_iobuf);
-      memcpy(&hw_addrs[intf_i * n_hw_pages], hw_addrs,
-             sizeof(hw_addrs[0]) * n_hw_pages);
-      continue;
-    }
 
     rc = oo_iobufset_resource_alloc(pages, pd, &iobuf,
                                     &hw_addrs[intf_i * n_hw_pages],
@@ -6243,10 +6289,6 @@ efab_tcp_helper_iobufset_map(tcp_helper_resource_t* trs,
     }
     map_order = CI_MIN(map_order, cur_map_order);
     all_out[intf_i] = iobuf;
-    if( first_pd == NULL ) {
-      first_pd = pd;
-      first_iobuf = iobuf;
-    }
   }
   if( page_order )
     *page_order = map_order;
@@ -6335,7 +6377,7 @@ efab_tcp_helper_iobufset_alloc(tcp_helper_resource_t* trs,
   }
 #endif
   rc = oo_iobufset_pages_alloc(HW_PAGES_PER_SET_S, min_nics_order, &flags,
-                               &pages);
+                               &pages, trs->thc_pktbuf_alloc);
   if( rc != 0 )
     return rc;
 #if CI_CFG_PKTS_AS_HUGE_PAGES
@@ -6669,6 +6711,9 @@ efab_tcp_helper_more_bufs(tcp_helper_resource_t* trs)
 {
   struct oo_iobufset* iobrs[CI_CFG_MAX_INTERFACES];
   struct oo_buffer_pages* pages;
+#ifdef OO_DO_HUGE_PAGES
+  struct oo_hugetlb_page *hugetlb_page;
+#endif
   uint64_t *hw_addrs;
   ci_irqlock_state_t lock_flags;
   ci_netif* ni = &trs->netif;
@@ -6704,9 +6749,10 @@ efab_tcp_helper_more_bufs(tcp_helper_resource_t* trs)
      * allocation failure) and permanent failure (out of buffer table
      * entries).
      */
-    if( rc == -ENOSPC )
+    if( rc == -ENOSPC ) {
       efab_tcp_helper_no_more_bufs(trs);
-    else {
+    }
+    else if( rc != -EINTR ) {
       ++ni->state->stats.bufset_alloc_fails;
       NI_LOG(ni, RESOURCE_WARNINGS,
              FN_FMT "Failed to allocate packet buffers (%d)",
@@ -6738,7 +6784,8 @@ efab_tcp_helper_more_bufs(tcp_helper_resource_t* trs)
   ++ni->pkt_sets_n;
   ni->pkt_bufs[bufset_id] = pages;
 #ifdef OO_DO_HUGE_PAGES
-  if( oo_iobufset_get_shmid(pages) >= 0 )
+  hugetlb_page = oo_iobufset_get_hugetlb_page(pages);
+  if( hugetlb_page )
     CITP_STATS_NETIF_INC(ni, pkt_huge_pages);
 #endif
   OO_STACK_FOR_EACH_INTF_I(ni, intf_i)
@@ -6759,9 +6806,10 @@ efab_tcp_helper_more_bufs(tcp_helper_resource_t* trs)
   ni->packets->set[bufset_id].free = OO_PP_NULL;
   ni->packets->set[bufset_id].n_free = PKTS_PER_SET;
 #ifdef OO_DO_HUGE_PAGES
-  ni->packets->set[bufset_id].shm_id = oo_iobufset_get_shmid(pages);
+  ni->packets->set[bufset_id].page_offset =
+    hugetlb_page ? hugetlb_page->page->index * CI_HUGEPAGE_SIZE : -1;
 #else
-  ni->packets->set[bufset_id].shm_id = -1;
+  ni->packets->set[bufset_id].page_offset = -1;
 #endif
   ni->packets->set[bufset_id].dma_addr_base = ni->dma_addr_next;
   if( page_order > CI_CFG_PKTS_PER_SET_S ) {
@@ -8637,6 +8685,49 @@ int efab_tcp_helper_efct_superbuf_config_refresh(
                           (unsigned long)CI_USER_PTR_GET(op->superbufs),
                           CI_USER_PTR_GET(op->current_mappings),
                           op->max_superbufs);
+}
+
+int efab_tcp_helper_pkt_buf_map(tcp_helper_resource_t* trs,
+                                oo_pkt_buf_map_t* arg)
+{
+  unsigned long addr;
+
+  if( trs->thc_pktbuf_alloc->offset < arg->offset)
+    return -EINVAL;
+
+  addr = vm_mmap(trs->thc_pktbuf_alloc->filp, 0, CI_HUGEPAGE_SIZE,
+                 PROT_READ | PROT_WRITE,
+                 MAP_SHARED | MAP_HUGETLB | MAP_HUGE_2MB,
+                 arg->offset);
+
+  if( IS_ERR((void*)addr) )
+    return PTR_ERR((void*)addr);
+
+  CI_USER_PTR_SET(arg->addr, addr);
+  return 0;
+}
+
+int efab_tcp_helper_design_parameters(tcp_helper_resource_t* trs,
+                                      oo_design_parameters_t* op)
+{
+  int rc;
+  struct efhw_nic* nic;
+  void* user_data = CI_USER_PTR_GET(op->data_ptr);
+  struct efab_nic_design_parameters dp = EFAB_NIC_DP_INITIALIZER;
+
+  if( op->intf_i >= oo_stack_intf_max(&trs->netif) )
+    return -EINVAL;
+
+  nic = efrm_client_get_nic(trs->nic[op->intf_i].thn_oo_nic->efrm_client);
+
+  if( dp.known_size > op->data_len )
+    dp.known_size = op->data_len;
+
+  rc = efhw_nic_design_parameters(nic, &dp);
+  if( rc < 0 )
+    return rc;
+
+  return copy_to_user(user_data, &dp, dp.known_size) ? -EFAULT : 0;
 }
 
 static tcp_helper_resource_t*

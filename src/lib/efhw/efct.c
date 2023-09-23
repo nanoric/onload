@@ -20,6 +20,7 @@
 #include <uapi/linux/ethtool.h>
 #include "ethtool_flow.h"
 #include <linux/hashtable.h>
+#include <etherfabric/internal/internal.h>
 #include "efct.h"
 #include "efct_superbuf.h"
 
@@ -45,7 +46,8 @@ static void efct_check_for_flushes(struct work_struct *work);
 
 int
 efct_nic_rxq_bind(struct efhw_nic *nic, int qid, bool timestamp_req,
-                  size_t n_hugepages, struct file* memfd, off_t* memfd_off,
+                  size_t n_hugepages,
+                  struct oo_hugetlb_allocator *hugetlb_alloc,
                   struct efab_efct_rxq_uk_shm_q *shm,
                   unsigned wakeup_instance, struct efhw_efct_rxq *rxq)
 {
@@ -66,12 +68,12 @@ efct_nic_rxq_bind(struct efhw_nic *nic, int qid, bool timestamp_req,
      * check as well */
     return -EINVAL;
   }
-  efct_provide_bind_memfd(memfd, *memfd_off);
+  efct_provide_hugetlb_alloc(hugetlb_alloc);
   EFCT_PRE(dev, edev, cli, nic, rc);
 
   rc = __efct_nic_rxq_bind(edev, cli, &qparams, nic->arch_extra, n_hugepages, shm, wakeup_instance, rxq);
   EFCT_POST(dev, edev, cli, nic, rc);
-  efct_unprovide_bind_memfd(memfd_off);
+  efct_unprovide_hugetlb_alloc();
   return rc;
 }
 
@@ -106,11 +108,71 @@ efct_get_hugepages(struct efhw_nic *nic, int hwqid,
   return rc;
 }
 
+static int
+efct_design_parameters(struct efhw_nic *nic,
+                       struct efab_nic_design_parameters *dp)
+{
+  struct device *dev;
+  struct xlnx_efct_device* edev;
+  struct xlnx_efct_client* cli;
+  union xlnx_efct_param_value val;
+  struct xlnx_efct_design_params* xp = &val.design_params;
+
+  int rc = 0;
+
+  EFCT_PRE(dev, edev, cli, nic, rc)
+  rc = edev->ops->get_param(cli, XLNX_EFCT_DESIGN_PARAM, &val);
+  EFCT_POST(dev, edev, cli, nic, rc);
+
+  if( rc < 0 )
+    return rc;
+
+  /* Where older versions of ef_vi make assumptions about parameter values, we
+   * must check that either they know about the parameter, or that the value
+   * matches the assumption.
+   *
+   * See documentation of efab_nic_design_parameters for details of
+   * compatibility issues.
+   */
+#define SET(PARAM, VALUE) \
+  if( EFAB_NIC_DP_KNOWN(*dp, PARAM) ) \
+    dp->PARAM = (VALUE);  \
+  else if( (VALUE) != EFAB_NIC_DP_DEFAULT(PARAM) ) \
+    return -ENODEV;
+
+  SET(rx_superbuf_bytes, xp->rx_buffer_len * 4096);
+  SET(rx_frame_offset, xp->frame_offset_fixed);
+  SET(tx_aperture_bytes, xp->tx_aperture_size);
+  SET(tx_fifo_bytes, xp->tx_fifo_size);
+  SET(timestamp_subnano_bits, xp->ts_subnano_bit);
+  SET(unsol_credit_seq_mask, xp->unsol_credit_seq_mask);
+
+  return 0;
+}
 
 static size_t
 efct_max_shared_rxqs(struct efhw_nic *nic)
 {
-  return CI_EFCT_MAX_RXQS;
+  /* FIXME: this should perhaps return the per-nic limit:
+   *
+   *  struct efhw_nic_efct* efct = nic->arch_extra;
+   *  return efct->rxq_n;
+   *
+   * However, in practice this is only used to determine the per-vi resources
+   * to be allocated in efab_efct_rxq_uk_shm_base, which currently has a fixed
+   * limit separate from the per-nic limit.
+   *
+   * Three ways to resolve this mismatch are:
+   *  - modify ef_vi to support an arbitrary limit (defined at run-time),
+   *    which can be set to match the per-nic limit;
+   *  - implement a separate mechanism to provide the per-vi limit to efrm so
+   *    that it can allocate the appropriate resources;
+   *  - hack this function so that existing code uses the correct per-vi limit.
+   *
+   * As we don't yet have the means to test extensive code changes on hardware
+   * with different per-nic and per-vi limits, I choose hackery for now.
+   */
+   return EF_VI_MAX_EFCT_RXQS;
 }
 
 /*----------------------------------------------------------------------------
@@ -182,6 +244,10 @@ efct_nic_init_hardware(struct efhw_nic *nic,
              | NIC_FLAG_VLAN_FILTERS
              | NIC_FLAG_RX_FILTER_ETHERTYPE
              | NIC_FLAG_HW_MULTICAST_REPLICATION
+             | NIC_FLAG_SHARED_PD
+             /* TODO: This will need to be updated to check for nic capabilities. */
+             | NIC_FLAG_RX_FILTER_TYPE_ETH_LOCAL
+             | NIC_FLAG_RX_FILTER_TYPE_ETH_LOCAL_VLAN
              ;
   efct_nic_tweak_hardware(nic);
   return 0;
@@ -192,7 +258,7 @@ void efct_nic_filter_init(struct efhw_nic_efct *efct)
 {
   if( ! filter_hash_table_seed_inited ) {
     filter_hash_table_seed_inited = true;
-    filter_hash_table_seed = get_random_int();
+    filter_hash_table_seed = get_random_u32();
   }
 
 #define ACTION_INIT_HASH_TABLE(F) \
@@ -242,11 +308,17 @@ efct_nic_event_queue_enable(struct efhw_nic *nic, uint32_t client_id,
     .unsol_credit = efhw_params->flags & EFHW_VI_TX_TIMESTAMPS ? CI_CFG_TIME_SYNC_EVENT_EVQ_CAPACITY  - 1 : 0,
   };
   struct efhw_nic_efct *efct = nic->arch_extra;
-  struct efhw_nic_efct_evq *efct_evq = &efct->evq[efhw_params->evq];
+  struct efhw_nic_efct_evq *efct_evq;
   int rc;
 #ifndef NDEBUG
   int i;
 #endif
+
+  /* This is a dummy EVQ, so nothing to do. */
+  if( efhw_params->evq >= efct->evq_n )
+    return 0;
+
+  efct_evq = &efct->evq[efhw_params->evq];
 
   /* We only look at the first page because this memory should be physically
    * contiguous, but the API provides us with an address per 4K (NIC page)
@@ -288,8 +360,14 @@ efct_nic_event_queue_disable(struct efhw_nic *nic, uint32_t client_id,
   struct xlnx_efct_device* edev;
   struct xlnx_efct_client* cli;
   struct efhw_nic_efct *efct = nic->arch_extra;
-  struct efhw_nic_efct_evq *efct_evq = &efct->evq[evq];
+  struct efhw_nic_efct_evq *efct_evq;
   int rc = 0;
+
+  /* This is a dummy EVQ, so nothing to do. */
+  if( evq >= efct->evq_n )
+    return;
+
+  efct_evq = &efct->evq[evq];
 
   /* In the normal case we'll be disabling the queue because all outstanding
    * flushes have completed. However, in the case of a flush timeout there may
@@ -322,6 +400,26 @@ efct_nic_wakeup_request(struct efhw_nic *nic, volatile void __iomem* io_page,
 
 static void efct_nic_sw_event(struct efhw_nic *nic, int data, int evq)
 {
+}
+
+static bool efct_accept_vi_constraints(struct efhw_nic *nic, int low,
+                                       unsigned order, void* arg)
+{
+  struct efhw_vi_constraints *vc = arg;
+  struct efhw_nic_efct *efct = nic->arch_extra;
+
+  /* If this VI will want a TXQ it needs a HW EVQ. These all fall within
+   * the range [0,efct->evq_n). We use the space above that to provide
+   * dummy EVQS. */
+  if( vc->want_txq ) {
+    if( low < efct->evq_n )
+      return efct->evq[low].txq != EFCT_EVQ_NO_TXQ;
+    else
+      return false;
+  }
+  else {
+    return low >= efct->evq_n;
+  }
 }
 
 /*--------------------------------------------------------------------
@@ -383,6 +481,7 @@ efct_dmaq_tx_q_init(struct efhw_nic *nic, uint32_t client_id,
   };
   int rc;
 
+  EFHW_ASSERT(txq_params->evq < efct->evq_n);
   EFHW_ASSERT(params.qid != EFCT_EVQ_NO_TXQ);
 
   EFCT_PRE(dev, edev, cli, nic, rc);
@@ -430,8 +529,7 @@ static void efct_check_for_flushes(struct work_struct *work)
     return;
 
   for(i = 0; i < evq->capacity; i++) {
-    if((CI_QWORD_FIELD(*event, EFCT_EVENT_TYPE) == EFCT_EVENT_TYPE_CONTROL ||
-        CI_QWORD_FIELD(*event, EFCT_EVENT_TYPE) == EFCT_EVENT_TYPE_CONTROL_LEGACY) &&
+    if(CI_QWORD_FIELD(*event, EFCT_EVENT_TYPE) == EFCT_EVENT_TYPE_CONTROL &&
        CI_QWORD_FIELD(*event, EFCT_CTRL_SUBTYPE) == EFCT_CTRL_EV_FLUSH &&
        CI_QWORD_FIELD(*event, EFCT_FLUSH_TYPE) == EFCT_FLUSH_TYPE_TX) {
       found_flush = true;
@@ -610,14 +708,14 @@ efct_vi_set_user(struct efhw_nic *nic, uint32_t vi_instance, uint32_t user)
  *--------------------------------------------------------------------*/
 static int
 efct_rss_alloc(struct efhw_nic *nic, const u32 *indir, const u8 *key,
-               u32 nic_rss_flags, int num_qs, u32 *rss_context_out)
+               u32 efhw_rss_mode, int num_qs, u32 *rss_context_out)
 {
   return -EOPNOTSUPP;
 }
 
 static int
 efct_rss_update(struct efhw_nic *nic, const u32 *indir, const u8 *key,
-                u32 nic_rss_flags, u32 rss_context)
+                u32 efhw_rss_mode, u32 rss_context)
 {
   return -EOPNOTSUPP;
 }
@@ -628,27 +726,16 @@ efct_rss_free(struct efhw_nic *nic, u32 rss_context)
   return -EOPNOTSUPP;
 }
 
-static int
-efct_rss_flags(struct efhw_nic *nic, u32 *flags_out)
-{
-  return -EOPNOTSUPP;
-}
-
 static uint32_t zero_remote_port(uint32_t l4_4_bytes)
 {
   return htonl(ntohl(l4_4_bytes) & 0xffff);
 }
 
-static int filter_spec_to_ethtool_spec(const struct efx_filter_spec *src,
-                                       struct ethtool_rx_flow_spec *dst)
+static int sanitise_ethtool_flow(struct ethtool_rx_flow_spec *dst)
 {
-  int rc = efx_spec_to_ethtool_flow(src, dst);
-  if( rc < 0 )
-    return rc;
-
   /* Blat out the remote fields: we can soft-filter them even though the
    * hardware can't */
-  switch (dst->flow_type & ~FLOW_EXT) {
+  switch (dst->flow_type & ~(FLOW_EXT | FLOW_MAC_EXT)) {
   case UDP_V4_FLOW:
   case TCP_V4_FLOW:
     EFHW_ASSERT(&dst->h_u.udp_ip4_spec == &dst->h_u.tcp_ip4_spec);
@@ -690,19 +777,59 @@ static int filter_spec_to_ethtool_spec(const struct efx_filter_spec *src,
                           zero_remote_port(dst->m_u.usr_ip6_spec.l4_4_bytes);
     break;
   case ETHER_FLOW:
+    dst->h_u.ether_spec.h_proto = 0;
+    dst->m_u.ether_spec.h_proto = 0;
     break;
   default:
     return -EPROTONOSUPPORT;
   }
 
+  /* We don't support MAC in combination with IP filters */
+  if (dst->flow_type & FLOW_MAC_EXT)
+    return -EPROTONOSUPPORT;
+
   if (dst->flow_type & FLOW_EXT) {
-    if (dst->m_ext.vlan_etype || dst->m_ext.vlan_tci != 0xffff ||
+    if (dst->m_ext.vlan_etype || dst->m_ext.vlan_tci != htons(0xfff) ||
         dst->m_ext.data[0] || dst->m_ext.data[1])
       return -EPROTONOSUPPORT;
-    dst->flow_type &= ~FLOW_EXT;
+    /* VLAN tags are only supported with flow_type ETHER_FLOW */
+    if ((dst->flow_type & ~(FLOW_EXT | FLOW_MAC_EXT)) != ETHER_FLOW)
+      dst->flow_type &= ~FLOW_EXT;
   }
 
   return 0;
+}
+
+static bool
+hw_filters_are_equal(const struct efct_filter_node *node,
+                     const struct efct_hw_filter *hw_filter,
+                     int clas)
+{
+  switch (clas) {
+  case FILTER_CLASS_semi_wild:
+  case FILTER_CLASS_full_match:
+    if (hw_filter->proto == node->proto &&
+        hw_filter->ip == node->u.ip4.lip &&
+        hw_filter->port == node->lport)
+      return true;
+    break;
+  case FILTER_CLASS_mac:
+  case FILTER_CLASS_mac_vlan:
+  /* The vlan id is checked for every filter, including MAC filters without a
+   * specified vlan, as otherwise we could get false positives between vlans.
+   */
+    if (!memcmp(&hw_filter->loc_mac, &node->loc_mac,
+        sizeof(node->loc_mac)) && hw_filter->outer_vlan == node->vlan)
+      return true;
+    break;
+  default:
+    /* This should only be called for filter types that correspond to a real
+     * HW filter. */
+    EFHW_ASSERT(0);
+    break;
+  }
+
+  return false;
 }
 
 
@@ -731,16 +858,20 @@ static bool find_one_filter(struct hlist_head* table, size_t hash_bits,
 }
 
 /* True iff 'node' is in 'table', i.e. if a packet matches one of our stored
- * filters for one specific class of filter. */
+ * filters for one specific class of filter.
+ *
+ * vlan_required parameter is used for filters that match on a single vlan id.
+ */
 static bool
 filter_matches(struct hlist_head* table, size_t hash_bits,
-               struct efct_filter_node* node, size_t node_len)
+               struct efct_filter_node* node, size_t node_len,
+               bool vlan_required)
 {
   bool found;
 
   rcu_read_lock();
   found = find_one_filter(table, hash_bits, node, node_len);
-  if( ! found ) {
+  if( ! found && ! vlan_required ) {
     int32_t vlan = node->vlan;
     node->vlan = -1;
     found = find_one_filter(table, hash_bits, node, node_len);
@@ -790,7 +921,7 @@ do_filter_insert(int clas, struct hlist_head* table, size_t *table_n,
     struct efct_filter_node* old;
     bool id_dup = false;
     node->filter_id = clas | (bkt << FILTER_CLASS_BITS) |
-                      (get_random_int() << (FILTER_CLASS_BITS + hash_bits));
+                      (get_random_u32() << (FILTER_CLASS_BITS + hash_bits));
     node->filter_id &= 0x7fffffff;
     hlist_for_each_entry_rcu(old, &table[bkt], node) {
       if( old->filter_id == node->filter_id ) {
@@ -826,14 +957,13 @@ do_filter_insert(int clas, struct hlist_head* table, size_t *table_n,
   return 0;
 }
 
-static void do_filter_del(struct efhw_nic_efct *efct, int filter_id,
-                         int* hw_filter)
+static struct efct_filter_node*
+lookup_filter_by_id(struct efhw_nic_efct *efct, int filter_id, size_t **class_n)
 {
   int clasi = 0;
   int clas = get_filter_class(filter_id);
 
-  *hw_filter = -1;
-#define ACTION_DEL_BY_FILTER_ID(F) \
+#define ACTION_LOOKUP_BY_FILTER_ID(F) \
     if( clasi++ == clas ) { \
       int bkt = (filter_id >> FILTER_CLASS_BITS) & \
                 (HASH_SIZE(efct->filters.F) - 1); \
@@ -841,25 +971,40 @@ static void do_filter_del(struct efhw_nic_efct *efct, int filter_id,
       hlist_for_each_entry_rcu(node, &efct->filters.F[bkt], node) { \
         if( node->filter_id == filter_id ) { \
           EFHW_ASSERT(efct->filters.F##_n > 0); \
-          *hw_filter = node->hw_filter; \
-          if ( node->hw_filter >= 0 ) {\
-            --efct->hw_filters[node->hw_filter].refcount; \
-          } \
-          if ( --node->refcount == 0 ) { \
-            hash_del_rcu(&node->node); \
-            --efct->filters.F##_n; \
-            kfree_rcu(node, free_list); \
-          } \
-          return; \
+          if( class_n ) \
+            *class_n = &efct->filters.F##_n; \
+          return node; \
         } \
       } \
     }
-  FOR_EACH_FILTER_CLASS(ACTION_DEL_BY_FILTER_ID)
+  FOR_EACH_FILTER_CLASS(ACTION_LOOKUP_BY_FILTER_ID)
+  return NULL;
+}
+
+static void do_filter_del(struct efhw_nic_efct *efct, int filter_id,
+                         int* hw_filter)
+{
+  size_t *class_n;
+  struct efct_filter_node *node = lookup_filter_by_id(efct, filter_id, &class_n);
+
+  *hw_filter = -1;
+  if( node ) {
+    *hw_filter = node->hw_filter;
+    if( node->hw_filter >= 0 ) {
+      --efct->hw_filters[node->hw_filter].refcount;
+    }
+    if( --node->refcount == 0 ) {
+      hash_del_rcu(&node->node);
+      --*class_n;
+      kfree_rcu(node, free_list);
+    }
+  }
 }
 
 static int
 efct_filter_insert(struct efhw_nic *nic, struct efx_filter_spec *spec,
-                   int *rxq, const struct cpumask *mask, unsigned flags)
+                   int *rxq, unsigned pd_excl_token, const struct cpumask *mask,
+                   unsigned flags)
 {
   int rc;
   struct ethtool_rx_flow_spec hw_filter;
@@ -873,25 +1018,46 @@ efct_filter_insert(struct efhw_nic *nic, struct efx_filter_spec *spec,
   int clas;
   bool insert_hw_filter = false;
   unsigned no_vlan_flags = spec->match_flags & ~EFX_FILTER_MATCH_OUTER_VID;
+  unsigned q_excl_token = 0;
 
   if( flags & EFHW_FILTER_F_REPLACE )
     return -EOPNOTSUPP;
-  rc = filter_spec_to_ethtool_spec(spec, &hw_filter);
+
+  /* Get the straight translation to ethtool spec of the requested filter.
+   * This allows us to make any necessary checks on the actually requested
+   * filter before we furtle it later on. */
+  rc = efx_spec_to_ethtool_flow(spec, &hw_filter);
   if( rc < 0 )
     return rc;
+
   params = (struct xlnx_efct_filter_params){
     .spec = &hw_filter,
     .mask = mask ? mask : cpu_all_mask,
   };
-  if( *rxq >= 0 )
-    hw_filter.ring_cookie = *rxq;
   if( flags & EFHW_FILTER_F_ANY_RXQ )
     params.flags |= XLNX_EFCT_FILTER_F_ANYQUEUE_LOOSE;
   if( flags & EFHW_FILTER_F_PREF_RXQ )
     params.flags |= XLNX_EFCT_FILTER_F_PREF_QUEUE;
-  if( flags & EFHW_FILTER_F_EXCL_RXQ )
+  if( flags & EFHW_FILTER_F_EXCL_RXQ ) {
     params.flags |= XLNX_EFCT_FILTER_F_EXCLUSIVE_QUEUE;
 
+    EFCT_PRE(dev, edev, cli, nic, rc);
+    rc = edev->ops->is_filter_supported(cli, &hw_filter);
+    EFCT_POST(dev, edev, cli, nic, rc);
+
+    if( !rc )
+      return -EPERM;
+  }
+
+  /* For some filter types we use wider HW filters to represent a more specific
+   * SW filter. This function handles any modifications that are needed to do
+   * this. */
+  rc = sanitise_ethtool_flow(&hw_filter);
+  if( rc < 0 )
+    return rc;
+
+  if( *rxq >= 0 )
+    hw_filter.ring_cookie = *rxq;
 
   /* Step 1 of 2: Convert ethtool_rx_flow_spec to efct_filter_node */
   memset(&node, 0, sizeof(node));
@@ -954,6 +1120,18 @@ efct_filter_insert(struct efhw_nic *nic, struct efx_filter_spec *spec,
     node.ethertype = EFCT_ETHERTYPE_IG_FILTER;
     node.proto = (spec->loc_mac[0] ? EFCT_PROTO_MCAST_IG_FILTER : EFCT_PROTO_UCAST_IG_FILTER);
   }
+  else if( no_vlan_flags == EFX_FILTER_MATCH_LOC_MAC ) {
+    if (spec->match_flags & EFX_FILTER_MATCH_OUTER_VID) {
+      clas = FILTER_CLASS_mac_vlan;
+      node.vlan = spec->outer_vid;
+    } else {
+      clas = FILTER_CLASS_mac;
+      node.vlan = -1;
+    }
+    node_len = offsetof(struct efct_filter_node, loc_mac) +
+               sizeof(node.loc_mac);
+    memcpy(&node.loc_mac, spec->loc_mac, sizeof(node.loc_mac));
+  }
   else {
     return -EPROTONOSUPPORT;
   }
@@ -964,22 +1142,43 @@ efct_filter_insert(struct efhw_nic *nic, struct efx_filter_spec *spec,
   /* Step 2 of 2: Insert efct_filter_node in to the correct hash table */
   mutex_lock(&efct->driver_filters_mtx);
 
-  if( spec->match_flags & EFX_FILTER_MATCH_LOC_HOST &&
-      node.ethertype == htons(ETH_P_IP) ) {
+  if ( *rxq > 0 ) {
+    q_excl_token = efct->exclusive_rxq_mapping[*rxq];
+
+    /* If the q excl tokens are 0, we are in a fresh state and can claim it.
+    *  If both the pd and q are EFHW_PD_NON_EXC_TOKEN, we are in a non-exclusive queue.
+    *  If the q one is set, but the pd one does not match, than the pd is overstepping on another rxq.
+    *  The q state is owned and managed by the driver and persists external to the application. */
+    if ( ( q_excl_token > 0 ) && ( q_excl_token != pd_excl_token ) ) {
+      mutex_unlock(&efct->driver_filters_mtx);
+      return -EPERM;
+    }
+  }
+
+  if( (spec->match_flags & EFX_FILTER_MATCH_LOC_HOST &&
+      node.ethertype == htons(ETH_P_IP)) ||
+      (spec->match_flags & EFX_FILTER_MATCH_LOC_MAC) ) {
     int i;
     int avail = -1;
-    for( i = 0; i < MAX_EFCT_HW_FILTERS; ++i ) {
+    for( i = 0; i < efct->hw_filters_n; ++i ) {
       if( ! efct->hw_filters[i].refcount )
         avail = i;
       else {
-        if( efct->hw_filters[i].proto == node.proto &&
-            efct->hw_filters[i].ip == node.u.ip4.lip &&
-            efct->hw_filters[i].port == node.lport ) {
+        if( hw_filters_are_equal(&node, &efct->hw_filters[i], clas) ) {
+
           if( ! (flags & (EFHW_FILTER_F_ANY_RXQ | EFHW_FILTER_F_PREF_RXQ) ) &&
               *rxq >= 0 && *rxq != efct->hw_filters[i].rxq ) {
             mutex_unlock(&efct->driver_filters_mtx);
             return -EEXIST;
           }
+
+          if ( efct->hw_filters[i].rxq > 0 && 
+               pd_excl_token != efct->exclusive_rxq_mapping[efct->hw_filters[i].rxq] ) {
+            /* Trying to attach onto an rxq owned by someone else. */
+            mutex_unlock(&efct->driver_filters_mtx);
+            return -EPERM;
+          }
+
           node.hw_filter = i;
           break;
         }
@@ -992,9 +1191,19 @@ efct_filter_insert(struct efhw_nic *nic, struct efx_filter_spec *spec,
         efct->hw_filters[avail].proto = node.proto;
         efct->hw_filters[avail].ip = node.u.ip4.lip;
         efct->hw_filters[avail].port = node.lport;
+        memcpy(&efct->hw_filters[avail].loc_mac, &node.loc_mac,
+                sizeof(node.loc_mac));
+        efct->hw_filters[avail].outer_vlan = node.vlan;
         insert_hw_filter = true;
       }
     }
+  }
+
+  /* If we aren't going to have a hw filter, then we definitely don't have an
+   * exclusive queue available. */
+  if( node.hw_filter < 0 && (flags & EFHW_FILTER_F_EXCL_RXQ) ) {
+    mutex_unlock(&efct->driver_filters_mtx);
+    return -EPERM;
   }
 
 #define ACTION_DO_FILTER_INSERT(F) \
@@ -1025,8 +1234,11 @@ efct_filter_insert(struct efhw_nic *nic, struct efx_filter_spec *spec,
       if( insert_hw_filter ) {
         efct->hw_filters[node.hw_filter].rxq = params.rxq_out;
         efct->hw_filters[node.hw_filter].drv_id = params.filter_id_out;
+        efct->hw_filters[node.hw_filter].hw_id = params.filter_handle;
       }
       *rxq = efct->hw_filters[node.hw_filter].rxq;
+      if ( *rxq > 0 )
+        efct->exclusive_rxq_mapping[*rxq] = pd_excl_token;
     }
     else {
       *rxq = 0;
@@ -1034,8 +1246,42 @@ efct_filter_insert(struct efhw_nic *nic, struct efx_filter_spec *spec,
   }
   mutex_unlock(&efct->driver_filters_mtx);
 
+  /* If we are returning successfully having requested an exclusive queue, that
+   * queue should not be shared with the net driver. */
+  EFHW_ASSERT((rc < 0) || !(flags & EFHW_FILTER_F_EXCL_RXQ) || (*rxq > 0));
+
   return rc < 0 ? rc : node.filter_id;
 }
+
+static void
+remove_exclusive_rxq_ownership(struct efhw_nic_efct* efct, int hw_filter)
+{
+  int i;
+  bool delete_owner = true;
+  int rxq = efct->hw_filters[hw_filter].rxq;
+
+  if( efct->exclusive_rxq_mapping[rxq] ) {
+    /* We should never have claimed rxq 0 as exclusive as this is always shared
+     * with the net driver. */
+    EFHW_ASSERT(rxq > 0);
+
+    /* Only bother worrying about exclusive mapping iff the filter has an exclusive entry */
+    for( i = 0; i < efct->hw_filters_n; ++i ) {
+      if ( efct->hw_filters[i].refcount ) {
+        /* Iff any of the currently active filters (ie refcount > 0) share the same rxq
+          * as the one we are attempting to delete, we cannot clear the rxq ownership.*/
+        if( efct->hw_filters[i].rxq == rxq ) {
+          delete_owner = false;
+          break;
+        }
+      }
+    }
+  }
+  
+  if ( delete_owner )
+    efct->exclusive_rxq_mapping[rxq] = 0;
+}
+
 
 static void
 efct_filter_remove(struct efhw_nic *nic, int filter_id)
@@ -1049,11 +1295,17 @@ efct_filter_remove(struct efhw_nic *nic, int filter_id)
   int drv_id = -1;
 
   mutex_lock(&efct->driver_filters_mtx);
+
   do_filter_del(efct, filter_id, &hw_filter);
+
   if( hw_filter >= 0 ) {
-    if( efct->hw_filters[hw_filter].refcount == 0 )
-      drv_id = efct->hw_filters[hw_filter].drv_id;
+    if( efct->hw_filters[hw_filter].refcount == 0 ) {
+        /* The above check implies the current filter is unused. */
+        drv_id = efct->hw_filters[hw_filter].drv_id;
+        remove_exclusive_rxq_ownership(efct, hw_filter);
+    }
   }
+
 
   mutex_unlock(&efct->driver_filters_mtx);
 
@@ -1096,6 +1348,10 @@ bool efct_packet_handled(void *driver_data, int rxq, bool flow_lookup,
   size_t pkt_len = CI_OWORD_FIELD(*header, EFCT_RX_HEADER_PACKET_LENGTH);
   struct netdev_hw_addr *hw_addr;
   bool is_mcast = false;
+  bool is_outer_vlan;
+  int32_t vlan;
+  size_t mac_node_len = offsetof(struct efct_filter_node, loc_mac) +
+                        sizeof(node.loc_mac);
 
   if( pkt_len < ETH_HLEN )
     return false;
@@ -1110,13 +1366,13 @@ bool efct_packet_handled(void *driver_data, int rxq, bool flow_lookup,
   /* -------- layer 2 -------- */
   l3_off = ETH_HLEN;
   memcpy(&node.ethertype, pkt + l3_off - 2, 2);
-  if( ethertype_is_vlan(node.ethertype) ) {
-    uint16_t tpid;
+  if( (is_outer_vlan = ethertype_is_vlan(node.ethertype)) ) {
+    uint16_t vid;
     l3_off += 4;
     if( pkt_len >= l3_off ) {
-      memcpy(&tpid, pkt + l3_off - 4, 2);
+      memcpy(&vid, pkt + l3_off - 4, 2);
       memcpy(&node.ethertype, pkt + l3_off - 2, 2);
-      node.vlan = tpid;
+      node.vlan = vid;
 
       /* Like U26z, we support only two VLAN nestings. The inner is only used
        * for skipping-over */
@@ -1127,6 +1383,27 @@ bool efct_packet_handled(void *driver_data, int rxq, bool flow_lookup,
       }
     }
   }
+  memcpy(&node.loc_mac, pkt + 0, ETH_ALEN);
+  /* Check for MAC+VLAN filter match */
+  if( is_outer_vlan ) {
+    if( filter_matches(efct->filters.mac_vlan,
+                      HASH_BITS(efct->filters.mac_vlan),
+                      &node, mac_node_len, true) )
+      return true;
+  }
+  /* Check for MAC filter match */
+  vlan = node.vlan;
+  node.vlan = -1;
+  if( filter_matches(efct->filters.mac,
+                      HASH_BITS(efct->filters.mac),
+                      &node, mac_node_len, true) )
+    return true;
+  node.vlan = vlan;
+
+  /* Only filters inserted into the mac and mac_vlan tables include a MAC, so
+   * unset this field now that we've failed to match those filter types. */
+  memset(&node.loc_mac, 0, sizeof(node.loc_mac));
+
   /* If there's no VLAN tag then we leave node.vlan=0, making us match EF10
    * and EF100 firmware behaviour by having a filter with vid==0 match packets
    * with no VLAN tag in addition to packets with the (technically-illegal)
@@ -1179,19 +1456,20 @@ bool efct_packet_handled(void *driver_data, int rxq, bool flow_lookup,
 
     if( filter_matches(efct->filters.full_match,
                        HASH_BITS(efct->filters.full_match),
-                       &node, full_match_node_len) )
+                       &node, full_match_node_len, false) )
       return true;
     node.rport = 0;
 
     if( filter_matches(efct->filters.semi_wild,
                           HASH_BITS(efct->filters.semi_wild),
-                          &node, semi_wild_node_len) )
+                          &node, semi_wild_node_len, false) )
       return true;
   }
 
   if( filter_matches(efct->filters.ethertype,
                         HASH_BITS(efct->filters.ethertype),
-                        &node, offsetof(struct efct_filter_node, proto)) )
+                        &node, offsetof(struct efct_filter_node, proto),
+                        false) )
     return true;
 
   if( !is_mcast ) {
@@ -1206,7 +1484,8 @@ bool efct_packet_handled(void *driver_data, int rxq, bool flow_lookup,
     node.proto = EFCT_PROTO_UCAST_IG_FILTER;
     if( filter_matches(efct->filters.ethertype,
                           HASH_BITS(efct->filters.ethertype),
-                          &node, offsetof(struct efct_filter_node, rport)) )
+                          &node, offsetof(struct efct_filter_node, rport),
+                          false) )
       return true;
   }
   else {
@@ -1225,7 +1504,8 @@ bool efct_packet_handled(void *driver_data, int rxq, bool flow_lookup,
     node.proto = EFCT_PROTO_MCAST_IG_FILTER;
     if( filter_matches(efct->filters.ethertype,
                           HASH_BITS(efct->filters.ethertype),
-                          &node, offsetof(struct efct_filter_node, rport)) )
+                          &node, offsetof(struct efct_filter_node, rport),
+                          false) )
       return true;
   }
 
@@ -1237,6 +1517,41 @@ efct_filter_redirect(struct efhw_nic *nic, int filter_id,
                      struct efx_filter_spec *spec)
 {
   return -EOPNOTSUPP;
+}
+
+static int
+efct_filter_query(struct efhw_nic *nic, int filter_id,
+                  struct efhw_filter_info *info)
+{
+  struct efhw_nic_efct *efct = nic->arch_extra;
+  int rc;
+  struct efct_filter_node *node;
+  int exclusivity_id = 0;
+
+  mutex_lock(&efct->driver_filters_mtx);
+  node = lookup_filter_by_id(efct, filter_id, NULL);
+  if( ! node ) {
+    rc = -ENOENT;
+  }
+  else if( node->hw_filter >= 0 ) {
+    info->hw_id = efct->hw_filters[node->hw_filter].hw_id;
+    info->rxq = efct->hw_filters[node->hw_filter].rxq;
+    exclusivity_id = efct->exclusive_rxq_mapping[info->rxq];
+    if ( exclusivity_id != 0 && exclusivity_id != EFHW_PD_NON_EXC_TOKEN )
+      info->flags |= EFHW_FILTER_F_IS_EXCL;
+    rc = 0;
+  }
+  else {
+    info->hw_id = -1;
+    /* No hardware filter was used, i.e. the traffic all goes to the default
+     * queue 0 and the filter exists only in software to tell the kernel
+     * networking stack to ignore these packets. */
+    info->rxq = 0;
+    info->flags = 0;
+    rc = 0;
+  }
+  mutex_unlock(&efct->driver_filters_mtx);
+  return rc;
 }
 
 static int
@@ -1381,6 +1696,7 @@ struct efhw_func_ops efct_char_functional_units = {
   efct_nic_wakeup_request,
   efct_nic_sw_event,
   efct_handle_event,
+  efct_accept_vi_constraints,
   efct_dmaq_tx_q_init,
   efct_dmaq_rx_q_init,
   efct_flush_tx_dma_channel,
@@ -1408,10 +1724,10 @@ struct efhw_func_ops efct_char_functional_units = {
   efct_rss_alloc,
   efct_rss_update,
   efct_rss_free,
-  efct_rss_flags,
   efct_filter_insert,
   efct_filter_remove,
   efct_filter_redirect,
+  efct_filter_query,
   efct_multicast_block,
   efct_unicast_block,
   efct_vport_alloc,
@@ -1423,6 +1739,7 @@ struct efhw_func_ops efct_char_functional_units = {
   efct_vi_io_region,
   efct_inject_reset_ev,
   efct_ctpio_addr,
+  efct_design_parameters,
   efct_max_shared_rxqs,
 };
 

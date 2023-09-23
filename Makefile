@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-2.0 OR BSD-2-Clause
+# X-SPDX-Copyright-Text: (c) Copyright 2019-2023 Xilinx, Inc.
+
 BUILD_PROFILE ?= extra
 export TRANSPORT_CONFIG_OPT_HDR ?= ci/internal/transport_config_opt_$(BUILD_PROFILE).h
 BUILD_ROOT ?= $(abspath build)
@@ -18,6 +21,7 @@ Options:
   MMAKE_LIBERAL=1  Turn off -Werror
   HAVE_SFC=0       Build without netdriver and driverlink support to work in
                    AF_XDP mode only
+  HAVE_EFCT=0      Build without EFCT and AUX bus support.
   BUILD_PROFILE=x  Onload configuration, e.g. "cloud" (default: extra)
   KBUILDTOP=<path> Where to put driver build (default: build/$$KARCH_linux-$$KVER)
   KPATH=<path>     Kernel to build for (default: /lib/modules/`uname -r`/build)
@@ -46,10 +50,50 @@ endif
 DRIVER_SUBDIRS := src/driver/linux_char src/driver/linux_onload \
                   src/driver/linux_resource src/lib/citools src/lib/ciul \
                   src/lib/cplane src/lib/transport/ip
+
+ifeq ($(KPATH),)
+  ifeq ($(KVER),)
+  KVER := $(shell uname -r)
+  endif
+  ifeq ($(KARCH),)
+  KARCH := $(shell uname -m)
+  endif
+  KPATH := /lib/modules/$(KVER)/build
+else
+ KVERARCH := $(subst $\",,$(shell echo 'UTS_RELEASE UTS_MACHINE'|gcc -E -P -include $(KPATH)/include/generated/utsrelease.h -include $(KPATH)/include/generated/compile.h -))
+ ifeq ($(KVERARCH),)
+   $(error Cannot extract kernel info from KPATH "$(KPATH)" - not a built tree?)
+ endif
+ KVER ?= $(firstword $(KVERARCH))
+ KARCH ?= $(lastword $(KVERARCH))
+endif
+
+export HAVE_EFCT ?=
+
+# There are three options here: native kernel aux bus support, support
+# through the out of tree cns aux bus repo for older kernels, or no aux
+# bus support at all, in that order of preference unless explicitly
+# asked to build without efct support.
+#
+ifeq ($(HAVE_EFCT),0)
+export HAVE_CNS_AUX := 0
+else ifneq ($(wildcard $(dir $(KPATH))/*/include/linux/auxiliary_bus.h),)
+export HAVE_KERNEL_AUX := 1
+export HAVE_CNS_AUX := 0
+else
 export AUX_BUS_PATH ?= $(abspath ../cns-auxiliary-bus)
 export HAVE_CNS_AUX := $(or $(and $(wildcard $(AUX_BUS_PATH)),1),0)
+endif
+
+export CI_HAVE_AUX_BUS := $(or $(filter 1, $(HAVE_CNS_AUX) $(HAVE_KERNEL_AUX)),0)
+
 ifneq ($(HAVE_CNS_AUX),0)
 KBUILD_EXTRA_SYMBOLS := $(AUX_BUS_PATH)/drivers/base/Module.symvers
+export KBUILD_EXTRA_SYMBOLS := $(AUX_BUS_PATH)/drivers/base/Module.symvers
+else
+ifneq (,$(wildcard /lib/modules/$(KVER)/updates/auxiliary.symvers))
+export KBUILD_EXTRA_SYMBOLS := /lib/modules/$(KVER)/updates/auxiliary.symvers
+endif
 endif
 
 export HAVE_SFC ?= 1
@@ -79,12 +123,15 @@ mkdirs:
 	@mkdir -p $(obj)/src/lib/efhw
 	@mkdir -p $(obj)/src/lib/efrm
 	@mkdir -p $(obj)/src/lib/efthrm
+	@mkdir -p $(obj)/src/lib/kernel_utils
 
 # Define the high-level dependencies between libraries:
 $(obj)/src/driver/linux_resource: $(AUTOCOMPAT) mkdirs
 $(obj)/src/lib/transport/ip: $(AUTOCOMPAT)
+$(obj)/src/lib/ciul: $(AUTOCOMPAT)
 $(obj)/src/lib/citools: $(AUTOCOMPAT)
 $(obj)/src/lib/cplane: $(AUTOCOMPAT) $(obj)/src/lib/ciul
+$(obj)/src/lib/kernel_utils: $(AUTOCOMPAT)
 $(obj)/src/driver/linux_char: $(AUTOCOMPAT)
 $(obj)/src/driver/linux_char: $(obj)/src/lib/citools $(obj)/src/lib/ciul
 $(obj)/src/driver/linux_onload: $(obj)/src/lib/citools $(obj)/src/lib/ciul \
@@ -100,22 +147,6 @@ else
 Q := @
 endif
 
-ifeq ($(KPATH),)
-  ifeq ($(KVER),)
-  KVER := $(shell uname -r)
-  endif
-  ifeq ($(KARCH),)
-  KARCH := $(shell uname -m)
-  endif
-  KPATH := /lib/modules/$(KVER)/build
-else
- KVERARCH := $(subst ",,$(shell echo 'UTS_RELEASE UTS_MACHINE'|gcc -E -P -include $(KPATH)/include/generated/utsrelease.h -include $(KPATH)/include/generated/compile.h -))
- ifeq ($(KVERARCH),)
-   $(error Cannot extract kernel info from KPATH "$(KPATH)" - not a built tree?)
- endif
- KVER ?= $(firstword $(KVERARCH))
- KARCH ?= $(lastword $(KVERARCH))
-endif
 KBUILDTOP := $(BUILD_ROOT)/$(BUILDTOP_EXTRA_PREFIX)$(KARCH)_linux-$(KVER)$(BUILDTOP_EXTRA_SUFFIX)
 override KBUILDTOP := $(abspath $(KBUILDTOP))
 OUTMAKEFILES := $(foreach D,$(DRIVER_SUBDIRS), \
@@ -140,35 +171,49 @@ $(eval $(patsubst CONFIG_%,export CONFIG_%$(_LF), \
 # CFLAGS
 ONLOAD_CFLAGS += -I$$(obj) -I$$(obj)/src -I$$(src) -I$$(src)/src -I$$(src)/src/include \
                  -D__ci_driver__ "-DTRANSPORT_CONFIG_OPT_HDR=<$(TRANSPORT_CONFIG_OPT_HDR)>"
-ONLOAD_CFLAGS += -DCI_HAVE_CNS_AUX=$(HAVE_CNS_AUX)
+ONLOAD_CFLAGS += -DCI_HAVE_AUX_BUS=$(CI_HAVE_AUX_BUS)
+
 ifneq ($(NDEBUG),)
 ONLOAD_CFLAGS += -DNDEBUG
 else
 ONLOAD_CFLAGS += -g
 endif
 ifneq ($(HAVE_CNS_AUX),0)
-ONLOAD_CFLAGS += -DCI_AUX_HEADER='"$(AUX_BUS_PATH)/include/linux/auxiliary_bus.h"'
-ONLOAD_CFLAGS += -DCI_AUX_MOD_HEADER='"$(AUX_BUS_PATH)/drivers/base/mod_devicetable_auxiliary.h"'
+ONLOAD_CFLAGS += -I$(AUX_BUS_PATH)/include
 endif
 
-X3_NET_HDR := linux/net/xilinx/xlnx_efct.h
-X3_NET_PATH ?= $(abspath ../x3-net-linux)
-ifneq ($(wildcard $(X3_NET_PATH)/include/$(X3_NET_HDR)),)
- ONLOAD_CFLAGS += -DCI_HAVE_X3_NET=1 -DCI_XLNX_EFCT_HEADER='"$(X3_NET_PATH)/include/$(X3_NET_HDR)"'
+ifeq ($(HAVE_EFCT),0)
+else ifeq ($(CI_HAVE_AUX_BUS),0)
+else ifneq ($(wildcard $(dir $(KPATH))/*/include/linux/net/xilinx/xlnx_efct.h),)
+HAVE_KERNEL_EFCT := 1
 else
- ifneq ($(wildcard $(KPATH)/include/$(X3_NET_HDR)),)
-  ONLOAD_CFLAGS += -DCI_HAVE_X3_NET=1 -DCI_XLNX_EFCT_HEADER='"$(X3_NET_HDR)"'
- else
-  ONLOAD_CFLAGS += -DCI_HAVE_X3_NET=0
- endif
+X3_NET_PATH ?= $(abspath ../x3-net-linux)
+HAVE_CNS_EFCT := $(or $(and $(wildcard $(X3_NET_PATH)/include/linux/net/xilinx/xlnx_efct.h),1),0)
+endif
+
+ifeq ($(or $(filter 1, $(HAVE_KERNEL_EFCT) $(HAVE_CNS_EFCT)),0),1)
+  ONLOAD_CFLAGS += -DCI_HAVE_EFCT_AUX=1
+  ifneq ($(HAVE_CNS_EFCT),0)
+    ONLOAD_CFLAGS += -I$(X3_NET_PATH)/include
+  endif
+else
+  ifneq ($(HAVE_EFCT),1)
+    ONLOAD_CFLAGS += -DCI_HAVE_EFCT_AUX=0
+  else
+    $(error Unable to build Onload with EFCT or AUX bus support)
+  endif
 endif
 
 ifneq ($(MMAKE_LIBERAL),1)
 ONLOAD_CFLAGS += -Werror
 endif
 
+ONLOAD_MAKEFLAGS ?=
+
 ifeq ($(HAVE_SFC),1)
   ONLOAD_CFLAGS += -DCI_HAVE_SFC=1
+  # This code base does not support Solarflare Siena.
+  ONLOAD_MAKEFLAGS += CONFIG_SFC_SIENA=
 else
   ONLOAD_CFLAGS += -DCI_HAVE_SFC=0
 endif
@@ -178,7 +223,7 @@ endif
 
 kernel: modules
 	@mkdir -p $(KBUILDTOP)/driver/linux
-	$(Q)ln -rsf $(KBUILDTOP)/src/driver/linux_onload/*.ko $(KBUILDTOP)/src/driver/linux_char/*.ko $(KBUILDTOP)/src/driver/linux_resource/*.ko $(KBUILDTOP)/src/driver/linux_net/drivers/net/ethernet/sfc/*.ko $(KBUILDTOP)/driver/linux
+	$(Q)ln -rsf $(wildcard $(patsubst %,$(KBUILDTOP)/%/*.ko,$(DRIVER_SUBDIRS))) $(KBUILDTOP)/driver/linux
 	$(Q)cp src/driver/linux/*.sh $(KBUILDTOP)/driver/linux
 
 modules modules_install: $(OUTMAKEFILES)
@@ -187,7 +232,8 @@ modules modules_install: $(OUTMAKEFILES)
 		"SRCPATH=$$PWD/src" \
 		'subdir-ccflags-y=$(subst ','\'',$(ONLOAD_CFLAGS))' \
 		MMAKE_IN_KBUILD=1 MMAKE_USE_KBUILD=1 MMAKE_NO_RULES=1 \
-		DRIVER=1 LINUX=1 $(patsubst modules,,$@)
+		DRIVER=1 LINUX=1 $(patsubst modules,,$@) \
+		$(ONLOAD_MAKEFLAGS)
 
 kernel: modules
 

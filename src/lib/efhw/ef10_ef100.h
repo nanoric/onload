@@ -42,6 +42,9 @@ extern int ef10_ef100_mcdi_cmd_event_queue_enable(struct efhw_nic *nic,
 extern void ef10_ef100_mcdi_cmd_event_queue_disable(struct efhw_nic *nic,
 						    uint32_t client_id, uint evq);
 
+extern bool ef10_ef100_accept_vi_constraints(struct efhw_nic *nic, int low,
+					     unsigned order, void* arg);
+
 extern void ef10_ef100_mcdi_cmd_driver_event(struct efhw_nic *nic, uint64_t data,
 					     uint32_t evq);
 
@@ -67,6 +70,8 @@ extern int ef10_ef100_mcdi_cmd_init_rxq(struct efhw_nic *nic,
 					uint32_t numentries, int ps_buf_size,
 					int flag_force_rx_merge, int ef100_rx_buffer_size);
 
+extern int ef10_ef100_design_parameters(struct efhw_nic *nic,
+                                        struct efab_nic_design_parameters *dp);
 extern size_t ef10_ef100_max_shared_rxqs(struct efhw_nic *nic);
 
 extern int ef10_ef100_flush_tx_dma_channel(struct efhw_nic *nic,
@@ -99,21 +104,26 @@ void ef10_ef100_nic_buffer_table_clear(struct efhw_nic *nic,
 				       int first_entry, int n_entries);
 
 extern int ef10_ef100_rss_alloc(struct efhw_nic *nic, const u32 *indir,
-				const u8 *key, u32 nic_rss_flags, int num_qs,
+				const u8 *key, u32 efhw_rss_mode, int num_qs,
 				u32 *rss_context_out);
 extern int ef10_ef100_rss_update(struct efhw_nic *nic, const u32 *indir,
-				 const u8 *key, u32 nic_rss_flags,
+				 const u8 *key, u32 efhw_rss_mode,
 				 u32 rss_context);
 extern int ef10_ef100_rss_free(struct efhw_nic *nic, u32 rss_context);
 extern int ef10_ef100_rss_flags(struct efhw_nic *nic, u32 *flags_out);
+extern int ef10_ef100_rss_mode_to_nic_flags(struct efhw_nic *efhw_nic,
+				u32 efhw_rss_mode, u32 *flags_out);
 
 struct efx_filter_spec;
 extern int ef10_ef100_filter_insert(struct efhw_nic *nic,
-				    struct efx_filter_spec *spec, int *rxq,
-				    const struct cpumask *mask, unsigned flags);
+				 	struct efx_filter_spec *spec, int *rxq,
+				 	unsigned pd_excl_token, const struct cpumask *mask,
+				 	unsigned flags);
 extern void ef10_ef100_filter_remove(struct efhw_nic *nic, int filter_id);
 extern int ef10_ef100_filter_redirect(struct efhw_nic *nic, int filter_id,
 				      struct efx_filter_spec *spec);
+extern int ef10_ef100_filter_query(struct efhw_nic *nic, int filter_id,
+                                   struct efhw_filter_info *info);
 
 extern int ef10_ef100_multicast_block(struct efhw_nic *nic, bool block);
 extern int ef10_ef100_unicast_block(struct efhw_nic *nic, bool block);
@@ -172,5 +182,8 @@ static inline void efhw_nic_release_dl_device(struct efhw_nic* nic,
 	/* This is safe even if [efx_dev] is NULL. */ \
 	efhw_nic_release_dl_device((nic), (efx_dev)); \
 }
+
+#define EF10_EF100_RSS_INDIRECTION_TABLE_LEN 128
+#define EF10_EF100_RSS_KEY_LEN 40
 
 #endif /* EFHW_EF10_EF100_H */

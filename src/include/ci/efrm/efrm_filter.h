@@ -40,13 +40,7 @@
 #ifndef __CI_EFRM_FILTER_H__
 #define __CI_EFRM_FILTER_H__
 
-#define EFRM_RSS_INDIRECTION_TABLE_LEN 128
 #define EFRM_RSS_KEY_LEN 40
-
-/* note mode default and src are mutually exclusive */
-#define EFRM_RSS_MODE_DEFAULT 0x1 /* standard non-tproxy mode */
-#define EFRM_RSS_MODE_SRC     0x2 /* semi transparent proxy passive side */
-#define EFRM_RSS_MODE_DST     0x4 /* transparent proxy active side */
 
 
 struct efx_filter_spec;
@@ -64,11 +58,14 @@ enum efrm_filter_block_flags {
 
 
 extern int  efrm_filter_insert(struct efrm_client *,
-			       struct efx_filter_spec *spec, int *rxq,
-			       const struct cpumask *mask, unsigned flags);
+				   struct efx_filter_spec *spec, int *rxq,
+				   unsigned pd_excl_token, const struct cpumask *mask,
+				   unsigned flags);
 extern void efrm_filter_remove(struct efrm_client *, int filter_id);
 extern int efrm_filter_redirect(struct efrm_client *,
 				int filter_id, struct efx_filter_spec *spec);
+extern int efrm_filter_query(struct efrm_client *, int filter_id, int *rxq,
+                             int *hw_id, int* flags);
 extern int efrm_filter_block_kernel(struct efrm_client *client, int flags,
                                     bool block);
 extern int efrm_ethtool_filter_remove(struct net_device* dev, int filter_id);
@@ -79,13 +76,13 @@ extern int efrm_ethtool_filter_insert(struct net_device* dev,
 int efrm_rss_context_alloc(struct efrm_client*, u32 vport_id,
 			   int shared,
 			   const u32 *indir,
-			   const u8 *key, u32 efrm_rss_mode,
+			   const u8 *key, u32 efhw_rss_mode,
 			   int num_qs,
 			   u32 *rss_context_out);
 
 extern int
 efrm_rss_context_update(struct efrm_client*, u32 rss_context, const u32 *indir,
-			const u8 *key, u32 efrm_rss_mode);
+			const u8 *key, u32 efhw_rss_mode);
 
 extern int efrm_rss_context_free(struct efrm_client*,
 				 u32 rss_context_id);

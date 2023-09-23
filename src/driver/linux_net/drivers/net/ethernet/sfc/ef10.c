@@ -1136,6 +1136,8 @@ static int efx_ef10_dimension_resources(struct efx_nic *efx)
 			  "%u VIs are not sufficient to map %u PIO buffers\n",
 			  nic_data->n_allocated_vis, nic_data->n_piobufs);
 		efx_ef10_free_piobufs(efx);
+		pio_write_vi_base = 0;
+		wc_mem_map_size = 0;
 	}
 
 	/* Extend the original UC mapping of the memory BAR */
@@ -2881,7 +2883,7 @@ static unsigned int efx_ef10_tx_max_skb_descs(struct efx_nic *efx)
 	return max_descs;
 }
 
-#ifdef CONFIG_SFC_DEBUGFS
+#ifdef CONFIG_DEBUG_FS
 #if defined(EFX_USE_KCOMPAT) && !defined(EFX_HAVE_UDP_TUNNEL_NIC_INFO)
 static int efx_debugfs_udp_tunnels(struct seq_file *file, void *data)
 {
@@ -2975,14 +2977,14 @@ static int efx_debugfs_read_netdev_dev_addr(struct seq_file *file, void *data)
 	return 0;
 }
 
-static struct efx_debugfs_parameter efx_debugfs[] = {
+static const struct efx_debugfs_parameter efx_debugfs[] = {
 #if defined(EFX_USE_KCOMPAT) && !defined(EFX_HAVE_UDP_TUNNEL_NIC_INFO)
 	_EFX_RAW_PARAMETER(udp_tunnels, efx_debugfs_udp_tunnels),
 #endif
 	{NULL},
 };
 
-static struct efx_debugfs_parameter netdev_debugfs[] = {
+static const struct efx_debugfs_parameter netdev_debugfs[] = {
 	_EFX_RAW_PARAMETER(netdev_uc_addr, efx_debugfs_read_netdev_uc_addr),
 	_EFX_RAW_PARAMETER(netdev_mc_addr, efx_debugfs_read_netdev_mc_addr),
 	_EFX_RAW_PARAMETER(netdev_uc_count, efx_debugfs_read_netdev_uc_count),
@@ -2991,7 +2993,15 @@ static struct efx_debugfs_parameter netdev_debugfs[] = {
 	_EFX_RAW_PARAMETER(netdev_dev_addr, efx_debugfs_read_netdev_dev_addr),
 	{NULL},
 };
-#endif /* CONFIG_SFC_DEBUGFS */
+#else /* CONFIG_DEBUG_FS */
+static const struct efx_debugfs_parameter efx_debugfs[] = {
+	{NULL}
+};
+
+static const struct efx_debugfs_parameter netdev_debugfs[] = {
+	{NULL}
+};
+#endif /* CONFIG_DEBUG_FS */
 
 static int efx_ef10_probe_multicast_chaining(struct efx_nic *efx)
 {
@@ -3051,12 +3061,10 @@ static int efx_ef10_probe_multicast_chaining(struct efx_nic *efx)
 static int efx_ef10_filter_table_probe(struct efx_nic *efx)
 {
 	struct efx_ef10_nic_data *nic_data = efx->nic_data;
-	bool rss_limited = efx_ef10_has_cap(nic_data->datapath_caps,
-					    RX_RSS_LIMITED);
 	bool additional_rss = efx_ef10_has_cap(nic_data->datapath_caps,
 					       ADDITIONAL_RSS_MODES);
 
-	return efx_mcdi_filter_table_probe(efx, rss_limited, additional_rss);
+	return efx_mcdi_filter_table_probe(efx, additional_rss);
 }
 
 static int efx_ef10_filter_table_init(struct efx_nic *efx)
@@ -3073,11 +3081,8 @@ static int efx_ef10_filter_table_init(struct efx_nic *efx)
 	if (rc)
 		return rc;
 
-#ifdef CONFIG_SFC_DEBUGFS
 	efx_extend_debugfs_port(efx, efx, 0, efx_debugfs);
 	efx_extend_debugfs_port(efx, efx->net_dev, 0, netdev_debugfs);
-#endif
-
 	return 0;
 }
 
@@ -3101,12 +3106,43 @@ static void efx_ef10_filter_table_down(struct efx_nic *efx)
 
 static void efx_ef10_filter_table_fini(struct efx_nic *efx)
 {
-#ifdef CONFIG_SFC_DEBUGFS
 	efx_trim_debugfs_port(efx, efx_debugfs);
 	efx_trim_debugfs_port(efx, netdev_debugfs);
-#endif
 	efx_mcdi_filter_table_fini(efx);
 }
+
+static int efx_ef10_pf_rx_push_rss_config(struct efx_nic *efx, bool user,
+					  const u32 *rx_indir_table,
+					  const u8 *key)
+{
+	struct efx_ef10_nic_data *nic_data = efx->nic_data;
+
+	if (efx_ef10_has_cap(nic_data->datapath_caps, RX_RSS_LIMITED))
+		return -EOPNOTSUPP;
+	return efx_mcdi_rx_push_rss_config(efx, user, rx_indir_table, key);
+}
+
+#ifdef CONFIG_SFC_SRIOV
+static int efx_ef10_vf_rx_push_rss_config(struct efx_nic *efx, bool user,
+					  const u32 *rx_indir_table,
+					  const u8 *key)
+{
+	struct efx_ef10_nic_data *nic_data = efx->nic_data;
+
+	if (efx_ef10_has_cap(nic_data->datapath_caps, RX_RSS_LIMITED))
+		return -EOPNOTSUPP;
+
+	/* on EF10 we're limited on RSS contexts, so do not push an exclusive
+	 * context, only accept a shared.
+	 */
+	if (user)
+		return -EOPNOTSUPP;
+	if (efx->rss_context.context_id != EFX_MCDI_RSS_CONTEXT_INVALID)
+		return 0;
+
+	return efx_mcdi_rx_push_shared_rss_config(efx, NULL);
+}
+#endif
 
 static int efx_ef10_rx_init(struct efx_rx_queue *rx_queue)
 {
@@ -4092,10 +4128,14 @@ static int efx_ef10_mac_reconfigure(struct efx_nic *efx, bool mtu_only)
 
 	efx_mcdi_filter_sync_rx_mode(efx);
 
-	rc = efx_mcdi_set_mac(efx);
-	if (rc == -EPERM && mtu_only &&
+	if (mtu_only &&
 	    efx_ef10_has_cap(nic_data->datapath_caps, SET_MAC_ENHANCED))
 		return efx_mcdi_set_mtu(efx);
+
+	rc = efx_mcdi_set_mac(efx);
+	if (rc == -EPERM && efx_ef10_is_vf(efx))
+		return 0;
+
 	return rc;
 }
 
@@ -5806,20 +5846,12 @@ static unsigned int efx_ef10_recycle_ring_size(const struct efx_nic *efx)
 	return ret;
 }
 
-#if !defined(EFX_USE_KCOMPAT) || defined(NETIF_F_IPV6_CSUM)
 #define EF10_OFFLOAD_FEATURES		\
 	(NETIF_F_IP_CSUM |		\
 	 NETIF_F_HW_VLAN_CTAG_FILTER |	\
 	 NETIF_F_IPV6_CSUM |		\
 	 NETIF_F_RXHASH |		\
 	 NETIF_F_NTUPLE)
-#else
-#define EF10_OFFLOAD_FEATURES		\
-	(NETIF_F_IP_CSUM |		\
-	 NETIF_F_HW_VLAN_CTAG_FILTER |	\
-	 NETIF_F_RXHASH |		\
-	 NETIF_F_NTUPLE)
-#endif
 
 #ifdef CONFIG_SFC_SRIOV
 const struct efx_nic_type efx_hunt_a0_vf_nic_type = {
@@ -5876,7 +5908,7 @@ const struct efx_nic_type efx_hunt_a0_vf_nic_type = {
 	.tx_limit_len = efx_ef10_tx_limit_len,
 	.tx_enqueue = __efx_enqueue_skb,
 	.tx_max_skb_descs = efx_ef10_tx_max_skb_descs,
-	.rx_push_rss_config = efx_mcdi_vf_rx_push_rss_config,
+	.rx_push_rss_config = efx_ef10_vf_rx_push_rss_config,
 	.rx_pull_rss_config = efx_mcdi_rx_pull_rss_config,
 	.rx_probe = efx_mcdi_rx_probe,
 	.rx_init = efx_ef10_rx_init,
@@ -6033,7 +6065,7 @@ const struct efx_nic_type efx_hunt_a0_nic_type = {
 	.tx_limit_len = efx_ef10_tx_limit_len,
 	.tx_max_skb_descs = efx_ef10_tx_max_skb_descs,
 	.tx_enqueue = __efx_enqueue_skb,
-	.rx_push_rss_config = efx_mcdi_pf_rx_push_rss_config,
+	.rx_push_rss_config = efx_ef10_pf_rx_push_rss_config,
 	.rx_pull_rss_config = efx_mcdi_rx_pull_rss_config,
 	.rx_push_rss_context_config = efx_mcdi_rx_push_rss_context_config,
 	.rx_pull_rss_context_config = efx_mcdi_rx_pull_rss_context_config,

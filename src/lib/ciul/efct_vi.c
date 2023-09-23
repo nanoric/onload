@@ -13,11 +13,17 @@
 #include <ci/efch/op_types.h>
 #endif
 #include "ef_vi_internal.h"
+#include <etherfabric/vi.h>
 #include <etherfabric/efct_vi.h>
 #include <etherfabric/internal/efct_uk_api.h>
 #include <ci/efhw/common.h>
 #include <ci/tools/byteorder.h>
+#include <ci/tools/sysdep.h>
 
+
+#define M_(FIELD) (CI_MASK64(FIELD ## _WIDTH) << FIELD ## _LBN)
+#define M(FIELD) M_(EFCT_RX_HEADER_ ## FIELD)
+#define CHECK_FIELDS (M(L2_STATUS) | M(L3_STATUS) | M(L4_STATUS) | M(ROLLOVER))
 
 struct efct_rx_descriptor
 {
@@ -30,26 +36,57 @@ struct efct_rx_descriptor
 
 /* pkt_ids are:
  *  bits 0..15 packet index in superbuf
- *  bits 16..25 superbuf index
- *  bits 26..28 rxq (as an index in to vi->efct_rxq, not as a hardware ID)
- *  bits 29..31 unused/zero
+ *  bits 16..24 superbuf index
+ *  bits 25..27 rxq (as an index in to vi->efct_rxq, not as a hardware ID)
+ *  bits 28..31 unused/zero
  *  [NB: bit 31 is stolen by some users to cache the superbuf's sentinel]
  * This layout is not part of the stable ABI. rxq index is slammed up against
  * superbuf index to allow for dirty tricks where we mmap all superbufs in
  * contiguous virtual address space and thus avoid some arithmetic.
  */
 
-#define PKTS_PER_SUPERBUF_BITS 16
+#define PKT_ID_PKT_BITS  16
+#define PKT_ID_SBUF_BITS  9
+#define PKT_ID_RXQ_BITS   3
+#define PKT_ID_TOTAL_BITS (PKT_ID_PKT_BITS + PKT_ID_SBUF_BITS + PKT_ID_RXQ_BITS)
+
+/* Enforce compile-time restrictions on the pkt_id fields */
+static inline void assert_pkt_id_fields(void)
+{
+  /* Packet index must be large enough for the number of packets in a superbuf.
+   * We check against the expected value here, and (at runtime) against the
+   * actual value provided by the driver in rx_rollover.
+   *
+   * The value of 16 is fairly arbitrary and could be reduced to 9 if more
+   * bits are needed elsewhere.
+   */
+  EF_VI_BUILD_ASSERT((1u << PKT_ID_PKT_BITS) >=
+                     (EFCT_RX_SUPERBUF_BYTES / EFCT_PKT_STRIDE));
+
+  /* Superbuf index must be exactly the right size for the number of superbufs
+   * per rxq, since the two fields are combined to give the global index.
+   *
+   * In principle, CI_EFCT_MAX_SUPERBUFS can be changed, but the bitfield size
+   * must be changed to match.
+   */
+  EF_VI_BUILD_ASSERT((1u << PKT_ID_SBUF_BITS) == CI_EFCT_MAX_SUPERBUFS);
+
+  /* Queue index must be large enough for the number of queues. */
+  EF_VI_BUILD_ASSERT((1u << PKT_ID_RXQ_BITS) >= EF_VI_MAX_EFCT_RXQS);
+
+  /* Bit 31 must be available for abuse. */
+  EF_VI_BUILD_ASSERT(PKT_ID_TOTAL_BITS <= 31);
+}
 
 static int pkt_id_to_index_in_superbuf(uint32_t pkt_id)
 {
-  return pkt_id & ((1u << PKTS_PER_SUPERBUF_BITS) - 1);
+  return pkt_id & ((1u << PKT_ID_PKT_BITS) - 1);
 }
 
 static int pkt_id_to_global_superbuf_ix(uint32_t pkt_id)
 {
-  EF_VI_ASSERT(pkt_id >> 29 == 0);
-  return pkt_id >> PKTS_PER_SUPERBUF_BITS;
+  EF_VI_ASSERT(pkt_id >> PKT_ID_TOTAL_BITS == 0);
+  return pkt_id >> PKT_ID_PKT_BITS;
 }
 
 static int pkt_id_to_local_superbuf_ix(uint32_t pkt_id)
@@ -138,7 +175,7 @@ static const char* efct_superbuf_base(const ef_vi* vi, size_t pkt_id)
    * an array lookup (or, more specifically, relying on the TLB to do the
    * lookup for us) */
   return vi->efct_rxq[0].superbuf +
-         pkt_id_to_global_superbuf_ix(pkt_id) * EFCT_RX_SUPERBUF_BYTES;
+         (size_t)pkt_id_to_global_superbuf_ix(pkt_id) * EFCT_RX_SUPERBUF_BYTES;
 #endif
 }
 
@@ -220,8 +257,6 @@ static bool efct_rx_check_event(const ef_vi* vi)
 
   if( ! vi->vi_rxq.mask )
     return false;
-  if( vi->vi_flags & EF_VI_EFCT_UNIQUEUE )
-    return efct_rxq_check_event(vi, 0);
   for( i = 0; i < EF_VI_MAX_EFCT_RXQS; ++i )
     if( efct_rxq_check_event(vi, i) )
       return true;
@@ -239,8 +274,7 @@ struct efct_tx_descriptor
 /* state of a partially-completed tx operation */
 struct efct_tx_state
 {
-  /* next write location within the aperture. NOTE: we assume the aperture is
-   * mapped twice, so that each packet can be written contiguously */
+  /* base address of the aperture */
   volatile uint64_t* aperture;
   /* up to 7 bytes left over after writing a block in 64-bit chunks */
   uint64_t tail;
@@ -248,6 +282,8 @@ struct efct_tx_state
   unsigned tail_len;
   /* number of 64-bit words from start of aperture */
   uint64_t offset;
+  /* mask to keep offset within the aperture range */
+  uint64_t mask;
 };
 
 /* generic tx header */
@@ -274,10 +310,11 @@ ci_inline uint64_t efct_tx_header(unsigned packet_length, unsigned ct_thresh,
 }
 
 /* tx header for standard (non-templated) send */
-ci_inline uint64_t efct_tx_pkt_header(ef_vi* vi, unsigned length, unsigned ct_thresh)
+ci_inline uint64_t
+efct_tx_pkt_header(ef_vi* vi, unsigned length, unsigned ct_thresh)
 {
-  unsigned timestamp_flag = (vi->vi_flags & EF_VI_TX_TIMESTAMPS ? 1 : 0);
-  return efct_tx_header(length, ct_thresh, timestamp_flag, 0, 0);
+  return efct_tx_header(length, ct_thresh, 0, 0, 0) |
+         vi->vi_txq.efct_fixed_header;
 }
 
 /* check that we have space to send a packet of this length */
@@ -295,12 +332,13 @@ ci_inline bool efct_tx_check(ef_vi* vi, int len)
 /* initialise state for a transmit operation */
 ci_inline void efct_tx_init(ef_vi* vi, struct efct_tx_state* tx)
 {
-  unsigned offset = vi->ep_state->txq.ct_added % EFCT_TX_APERTURE;
+  unsigned offset = vi->ep_state->txq.ct_added;
   BUG_ON(offset % EFCT_TX_ALIGNMENT != 0);
   tx->aperture = (void*) vi->vi_ctpio_mmap_ptr;
   tx->tail = 0;
   tx->tail_len = 0;
   tx->offset = offset >> 3;
+  tx->mask = vi->vi_txq.efct_aperture_mask;
 }
 
 /* store a left-over byte from the start or end of a block */
@@ -314,8 +352,7 @@ ci_inline void efct_tx_tail_byte(struct efct_tx_state* tx, uint8_t byte)
 /* write a 64-bit word to the CTPIO aperture, dealing with wrapping */
 ci_inline void efct_tx_word(struct efct_tx_state* tx, uint64_t value)
 {
-  *(tx->aperture + tx->offset++) = value;
-  tx->offset %= EFCT_TX_APERTURE >> 3;
+  tx->aperture[tx->offset++ & tx->mask] = value;
 }
 
 /* write a block of bytes to the CTPIO aperture, dealing with wrapping and leftovers */
@@ -411,8 +448,9 @@ static void efct_grant_unsol_credit(ef_vi* vi, bool clear_overflow, uint32_t cre
   uint32_t* unsol_reg = (void*) (vi->io + EFCT_EVQ_UNSOL_CREDIT_REGISTER_OFFSET);
   ci_qword_t qword;
 
+  credit_seq &= vi->unsol_credit_seq_mask;
   CI_POPULATE_QWORD_2(qword,
-                      EFCT_EVQ_UNSOL_GRANT_SEQ, credit_seq & CI_MASK32(EFCT_EVQ_UNSOL_GRANT_MAX_SEQ_WIDTH),
+                      EFCT_EVQ_UNSOL_GRANT_SEQ, credit_seq,
                       EFCT_EVQ_UNSOL_CLEAR_OVERFLOW, clear_overflow);
 
   writel(qword.u64[0], unsol_reg);
@@ -435,11 +473,12 @@ static void efct_tx_handle_event(ef_vi* vi, ci_qword_t event, ef_event* ev_out)
     qs->previous += 1;
   }
 
-  if ( vi->vi_flags & EF_VI_TX_TIMESTAMPS ) {
+  if( CI_QWORD_FIELD(event, EFCT_TX_EVENT_TIMESTAMP_STATUS) ) {
     uint64_t ptstamp;
     uint32_t ptstamp_seconds;
     uint32_t timesync_seconds;
 
+    EF_VI_ASSERT(vi->vi_flags & EF_VI_TX_TIMESTAMPS);
     EF_VI_ASSERT(CI_QWORD_FIELD(event, EFCT_TX_EVENT_TIMESTAMP_STATUS) == 1);
     ptstamp = CI_QWORD_FIELD64(event, EFCT_TX_EVENT_PARTIAL_TSTAMP);
     ptstamp_seconds = ptstamp >> 32;
@@ -448,7 +487,7 @@ static void efct_tx_handle_event(ef_vi* vi, ci_qword_t event, ef_event* ev_out)
     if ( ptstamp_seconds == ((timesync_seconds + 1) % 256) ) {
       ev_out->tx_timestamp.ts_sec++;
     } 
-    ev_out->tx_timestamp.ts_nsec = (ptstamp & 0xFFFFFFFF) >> DP_PARTIAL_TSTAMP_SUB_NANO_BITS;
+    ev_out->tx_timestamp.ts_nsec = (ptstamp & 0xFFFFFFFF) >> vi->ts_subnano_bits;
     ev_out->tx_timestamp.ts_nsec &= ~EF_EVENT_TX_WITH_TIMESTAMP_SYNC_MASK;
     ev_out->tx_timestamp.ts_nsec |= vi->ep_state->evq.sync_flags;
     ev_out->tx_timestamp.type = EF_EVENT_TYPE_TX_WITH_TIMESTAMP;
@@ -534,6 +573,13 @@ static void efct_ef_vi_transmit_copy_pio_warm(ef_vi* vi, int pio_offset,
 {
 }
 
+static bool tx_warm_active(ef_vi* vi)
+{
+  ci_qword_t qword;
+  qword.u64[0] = vi->vi_txq.efct_fixed_header;
+  return CI_QWORD_FIELD(qword, EFCT_TX_HEADER_WARM_FLAG);
+}
+
 #define EFCT_TX_POSTED_ID 0xefc7efc7
 static void efct_ef_vi_transmitv_ctpio(ef_vi* vi, size_t len,
                                        const struct iovec* iov, int iovcnt,
@@ -542,6 +588,7 @@ static void efct_ef_vi_transmitv_ctpio(ef_vi* vi, size_t len,
   struct efct_tx_state tx;
   unsigned threshold_extra;
   int i;
+  uint32_t dma_id;
 
   /* If we didn't have space then we must report this in _fallback and have
    * another go */
@@ -568,12 +615,15 @@ static void efct_ef_vi_transmitv_ctpio(ef_vi* vi, size_t len,
 
   /* Use a valid but bogus dma_id rather than invalid EF_REQUEST_ID_MASK to
    * support tcpdirect, which relies on the correct return value from
-   * ef_vi_transmit_unbundle to free its otherwise * unused transmit buffers.
+   * ef_vi_transmit_unbundle to free its otherwise unused transmit buffers.
    *
    * For compat with existing ef_vi apps which will post a fallback and may
    * want to use the dma_id we'll replace this value with the real one then.
+   *
+   * For transmit warmup, use an invalid dma_id so that it is ignored.
    */
-  efct_tx_complete(vi, &tx, EFCT_TX_POSTED_ID, len);
+  dma_id = tx_warm_active(vi) ? EF_REQUEST_ID_MASK : EFCT_TX_POSTED_ID;
+  efct_tx_complete(vi, &tx, dma_id, len);
 }
 
 static void efct_ef_vi_transmitv_ctpio_copy(ef_vi* vi, size_t frame_len,
@@ -649,6 +699,25 @@ static int efct_ef_vi_transmit_alt_go(ef_vi* vi, unsigned alt_id)
   return -EOPNOTSUPP;
 }
 
+static int efct_ef_vi_receive_set_discards(ef_vi* vi, unsigned discard_err_flags)
+{
+  discard_err_flags &= EF_VI_DISCARD_RX_L4_CSUM_ERR |
+                       EF_VI_DISCARD_RX_L3_CSUM_ERR |
+                       EF_VI_DISCARD_RX_ETH_FCS_ERR |
+                       EF_VI_DISCARD_RX_ETH_LEN_ERR |
+                       EF_VI_DISCARD_RX_L2_CLASS_OTHER |
+                       EF_VI_DISCARD_RX_L3_CLASS_OTHER |
+                       EF_VI_DISCARD_RX_L4_CLASS_OTHER;
+
+  vi->rx_discard_mask = discard_err_flags;
+  return 0;
+}
+
+static uint64_t efct_ef_vi_receive_get_discards(ef_vi* vi)
+{
+  return vi->rx_discard_mask;
+}
+
 static int efct_ef_vi_transmit_alt_discard(ef_vi* vi, unsigned alt_id)
 {
   return -EOPNOTSUPP;
@@ -680,7 +749,7 @@ static int rx_rollover(ef_vi* vi, int qid)
   if( rc < 0 )
     return rc;
 
-  pkt_id = (qid * CI_EFCT_MAX_SUPERBUFS + rc) << PKTS_PER_SUPERBUF_BITS;
+  pkt_id = (qid * CI_EFCT_MAX_SUPERBUFS + rc) << PKT_ID_PKT_BITS;
   next = pkt_id | ((uint32_t)sentinel << 31);
 
   if( pkt_id_to_index_in_superbuf(rxq_ptr->next) > superbuf_pkts ) {
@@ -701,7 +770,7 @@ static int rx_rollover(ef_vi* vi, int qid)
 
   /* Preload the superbuf's refcount with all the (potential) packets in
    * it - more efficient than incrementing for each rx individually */
-  EF_VI_ASSERT(superbuf_pkts < (1 << PKTS_PER_SUPERBUF_BITS));
+  EF_VI_ASSERT(superbuf_pkts < (1 << PKT_ID_PKT_BITS));
   desc = efct_rx_desc(vi, pkt_id);
   desc->refcnt = superbuf_pkts;
   desc->superbuf_pkts = superbuf_pkts;
@@ -709,7 +778,7 @@ static int rx_rollover(ef_vi* vi, int qid)
   return 0;
 }
 
-static void efct_rx_discard(int qid, uint32_t pkt_id,
+static void efct_rx_discard(int qid, uint32_t pkt_id, uint16_t discard_flags,
                             const ci_oword_t* header, ef_event* ev)
 {
   ev->rx_ref_discard.type = EF_EVENT_TYPE_RX_REF_DISCARD;
@@ -717,17 +786,48 @@ static void efct_rx_discard(int qid, uint32_t pkt_id,
                                              EFCT_RX_HEADER_PACKET_LENGTH);
   ev->rx_ref_discard.pkt_id = pkt_id;
   ev->rx_ref_discard.q_id = qid;
+  ev->rx_ref_discard.filter_id = CI_OWORD_FIELD(*header, EFCT_RX_HEADER_FILTER);
   ev->rx_ref_discard.user = CI_OWORD_FIELD(*header,
                                               EFCT_RX_HEADER_USER);
-  ev->rx_ref_discard.flags =
-    (CI_OWORD_FIELD(*header, EFCT_RX_HEADER_L2_STATUS) & 1 ?
-            EF_VI_DISCARD_RX_ETH_LEN_ERR : 0) |
-    (CI_OWORD_FIELD(*header, EFCT_RX_HEADER_L2_STATUS) & 2 ?
-            EF_VI_DISCARD_RX_ETH_FCS_ERR : 0) |
-    (CI_OWORD_FIELD(*header, EFCT_RX_HEADER_L3_STATUS) ?
-            EF_VI_DISCARD_RX_L3_CSUM_ERR : 0) |
-    (CI_OWORD_FIELD(*header, EFCT_RX_HEADER_L4_STATUS) ?
-            EF_VI_DISCARD_RX_L4_CSUM_ERR : 0);
+  ev->rx_ref_discard.flags = discard_flags;
+}
+
+static inline uint16_t header_status_flags(const ci_oword_t *header)
+{
+  uint16_t flags = 0;
+
+  if ( CI_OWORD_FIELD(*header, EFCT_RX_HEADER_L2_STATUS) ==
+                      EFCT_RX_HEADER_L2_STATUS_FCS_ERR )
+    flags |= EF_VI_DISCARD_RX_ETH_FCS_ERR;
+  if ( CI_OWORD_FIELD(*header, EFCT_RX_HEADER_L2_STATUS) ==
+                      EFCT_RX_HEADER_L2_STATUS_LEN_ERR )
+    flags |= EF_VI_DISCARD_RX_ETH_LEN_ERR;
+  if ( (CI_OWORD_FIELD(*header, EFCT_RX_HEADER_L3_CLASS) ==
+                       EFCT_RX_HEADER_L3_CLASS_IP4) &&
+       (header->u64[0] & M(L3_STATUS)) )
+    flags |= EF_VI_DISCARD_RX_L3_CSUM_ERR;
+  if ( (CI_OWORD_FIELD(*header, EFCT_RX_HEADER_L3_CLASS) ==
+                       EFCT_RX_HEADER_L3_CLASS_IP6) &&
+       (header->u64[0] & M(L3_STATUS)) )
+    flags |= EF_VI_DISCARD_RX_L3_CSUM_ERR;
+  if ( (CI_OWORD_FIELD(*header, EFCT_RX_HEADER_L4_CLASS) ==
+                       EFCT_RX_HEADER_L4_CLASS_TCP) &&
+       (header->u64[0] & M(L4_STATUS)) )
+    flags |= EF_VI_DISCARD_RX_L4_CSUM_ERR;
+  if ( (CI_OWORD_FIELD(*header, EFCT_RX_HEADER_L4_CLASS) ==
+                       EFCT_RX_HEADER_L4_CLASS_UDP) &&
+       (header->u64[0] & M(L4_STATUS)) )
+    flags |= EF_VI_DISCARD_RX_L4_CSUM_ERR;
+  if ( (CI_OWORD_FIELD(*header, EFCT_RX_HEADER_L4_CLASS) ==
+                        EFCT_RX_HEADER_L4_CLASS_OTHER) )
+      flags |= EF_VI_DISCARD_RX_L4_CLASS_OTHER;
+  if ( (CI_OWORD_FIELD(*header, EFCT_RX_HEADER_L3_CLASS) ==
+                        EFCT_RX_HEADER_L3_CLASS_OTHER) )
+      flags |= EF_VI_DISCARD_RX_L3_CLASS_OTHER;
+  if ( (CI_OWORD_FIELD(*header, EFCT_RX_HEADER_L2_CLASS) ==
+                        EFCT_RX_HEADER_L2_CLASS_OTHER) )
+      flags |= EF_VI_DISCARD_RX_L2_CLASS_OTHER;
+  return flags;
 }
 
 static inline int efct_poll_rx(ef_vi* vi, int qid, ef_event* evs, int evs_len)
@@ -772,6 +872,7 @@ static inline int efct_poll_rx(ef_vi* vi, int qid, ef_event* evs, int evs_len)
     const ci_oword_t* header;
     struct efct_rx_descriptor* desc;
     uint32_t pkt_id;
+    uint16_t discard_flags = 0;
 
     header = efct_rx_next_header(vi, rxq_ptr->next);
     if( header == NULL )
@@ -780,11 +881,10 @@ static inline int efct_poll_rx(ef_vi* vi, int qid, ef_event* evs, int evs_len)
     pkt_id = rxq_ptr->prev;
     desc = efct_rx_desc(vi, pkt_id);
 
-#define M_(FIELD) (CI_MASK64(FIELD ## _WIDTH) << FIELD ## _LBN)
-#define M(FIELD) M_(EFCT_RX_HEADER_ ## FIELD)
-#define CHECK_FIELDS (M(L2_STATUS) | M(L3_STATUS) | M(L4_STATUS) | M(ROLLOVER))
-    if(unlikely( header->u64[0] & CHECK_FIELDS )) {
-
+    /* Do a course grained check first, then get rid of the false positives.*/
+    if(unlikely( header->u64[0] & CHECK_FIELDS ) &&
+       (header->u64[0] & M(ROLLOVER) ||
+        (discard_flags = header_status_flags(header) & vi->rx_discard_mask)) ) {
       if( CI_OWORD_FIELD(*header, EFCT_RX_HEADER_ROLLOVER) ) {
         /* We created the desc->refcnt assuming that this superbuf would be
          * full of packets. It wasn't, so consume all the unused refs */
@@ -813,7 +913,7 @@ static inline int efct_poll_rx(ef_vi* vi, int qid, ef_event* evs, int evs_len)
         break;
       }
 
-      efct_rx_discard(qid, pkt_id, header, &evs[i]);
+      efct_rx_discard(shm->qid, pkt_id, discard_flags, header, &evs[i]);
     }
     else {
       /* For simplicity, require configuration for a fixed data offset.
@@ -826,7 +926,11 @@ static inline int efct_poll_rx(ef_vi* vi, int qid, ef_event* evs, int evs_len)
       evs[i].rx_ref.type = EF_EVENT_TYPE_RX_REF;
       evs[i].rx_ref.len = CI_OWORD_FIELD(*header, EFCT_RX_HEADER_PACKET_LENGTH);
       evs[i].rx_ref.pkt_id = pkt_id;
-      evs[i].rx_ref.q_id = qid;
+      /* q_id should technically be set to the queue label, however currently
+       * we don't allow the label to be changed so it's always the hardware
+       * qid */
+      evs[i].rx_ref.q_id = shm->qid;
+      evs[i].rx_ref.filter_id = CI_OWORD_FIELD(*header, EFCT_RX_HEADER_FILTER);
       evs[i].rx_ref.user = CI_OWORD_FIELD(*header, EFCT_RX_HEADER_USER);
     }
 
@@ -901,25 +1005,29 @@ int efct_poll_tx(ef_vi* vi, ef_event* evs, int evs_len)
 {
   ef_eventq_state* evq = &vi->ep_state->evq;
   ci_qword_t* event;
-  int i;
   int n_evs = 0;
 
   /* Check for overflow. If the previous entry has been overwritten already,
    * then it will have the wrong phase value and will appear invalid */
   BUG_ON(efct_tx_get_event(vi, evq->evq_ptr - sizeof(*event)) == NULL);
 
-  for( i = 0; i < evs_len; ++i, evq->evq_ptr += sizeof(*event) ) {
+  while( n_evs < evs_len ) {
     event = efct_tx_get_event(vi, evq->evq_ptr);
     if( event == NULL )
       break;
+    evq->evq_ptr += sizeof(*event);
 
     switch( CI_QWORD_FIELD(*event, EFCT_EVENT_TYPE) ) {
       case EFCT_EVENT_TYPE_TX:
         efct_tx_handle_event(vi, *event, &evs[n_evs]);
         n_evs++;
-        break;
+        /* Don't report more than one tx event per poll. This is to avoid a
+         * horrendous sequencing problem if a simple TX event is followed by a
+         * TX_WITH_TIMESTAMP; we'd need to update the queue state for the
+         * second event *after* the later call to ef_vi_transmit_unbundle()
+         * for the first event. */
+        return n_evs;
       case EFCT_EVENT_TYPE_CONTROL:
-      case EFCT_EVENT_TYPE_CONTROL_LEGACY:
         n_evs += efct_tx_handle_control_event(vi, *event, &evs[n_evs]);
         break;
       default:
@@ -932,18 +1040,7 @@ int efct_poll_tx(ef_vi* vi, ef_event* evs, int evs_len)
   return n_evs;
 }
 
-static int efct_ef_eventq_poll_1rxtx(ef_vi* vi, ef_event* evs, int evs_len)
-{
-  int i = 0;
-
-  if( efct_rxq_is_active(&vi->efct_shm->q[0]) )
-    i = efct_poll_rx(vi, 0, evs, evs_len);
-  i += efct_poll_tx(vi, evs + i, evs_len - i);
-
-  return i;
-}
-
-static int efct_ef_eventq_poll_generic(ef_vi* vi, ef_event* evs, int evs_len)
+static int efct_ef_eventq_poll(ef_vi* vi, ef_event* evs, int evs_len)
 {
   int n = 0;
   uint64_t qs = vi->efct_shm->active_qs;
@@ -1076,6 +1173,8 @@ int efct_vi_mmap_init_internal(ef_vi* vi,
     free(mappings);
     return -ENOMEM;
   }
+  
+  madvise(space, vi->max_efct_rxq * bytes_per_rxq, MADV_DONTDUMP);
 #endif
 
   vi->efct_shm = shm;
@@ -1130,17 +1229,6 @@ int efct_vi_find_free_rxq(ef_vi* vi, int qid)
 }
 
 #ifndef __KERNEL__
-/* These definitions are needed to be able to build on old distros, but we
- * have them on new builds too so that we get 'free' checking that they're
- * the correct values */
-#define MFD_CLOEXEC 1U
-#define MFD_HUGETLB 4U
-#if defined __x86_64__
-#define __NR_memfd_create 319
-#elif defined __aarch64__
-#define __NR_memfd_create 279
-#endif
-
 int efct_vi_attach_rxq(ef_vi* vi, int qid, unsigned n_superbufs)
 {
   int rc;
@@ -1153,16 +1241,14 @@ int efct_vi_attach_rxq(ef_vi* vi, int qid, unsigned n_superbufs)
   ix = efct_vi_find_free_rxq(vi, qid);
   if( ix < 0 )
     return ix;
-  if( ix > 0 && vi->vi_flags & EF_VI_EFCT_UNIQUEUE ) {
-    /* An attempt to add a filter which caused this must mean that some other
-     * app is already using the same 3-tuple, hence the error EADDRINUSE */
-    return -EADDRINUSE;
-  }
 
   /* The kernel code can cope with no memfd being provided, but only on older
-   * kernels. MFD_HUGETLB is available in >=4.14 (after memfd_create() itself
-   * in >=3.17). The fallback employs efrm_find_ksym(), so stopped working in
-   * >=5.7. Plenty of overlap. */
+   * kernels, i.e. older than 5.7 where the fallback with efrm_find_ksym()
+   * stopped working. Overall:
+   * - Onload uses the efrm_find_ksym() fallback on Linux older than 4.14.
+   * - Both efrm_find_ksym() and memfd_create(MFD_HUGETLB) are available
+   *   on Linux between 4.14 and 5.7.
+   * - Onload can use only memfd_create(MFD_HUGETLB) on Linux 5.7+. */
   {
     char name[32];
     snprintf(name, sizeof(name), "ef_vi:%d", qid);
@@ -1202,7 +1288,6 @@ int efct_vi_attach_rxq(ef_vi* vi, int qid, unsigned n_superbufs)
   ra.u.rxq.in_n_hugepages = n_hugepages;
   ra.u.rxq.in_timestamp_req = true;
   ra.u.rxq.in_memfd = mfd;
-  ra.u.rxq.in_memfd_off = 0;
   rc = ci_resource_alloc(vi->dh, &ra);
   if( mfd >= 0 )
     close(mfd);
@@ -1239,15 +1324,70 @@ void efct_vi_start_rxq(ef_vi* vi, int ix)
 
 /* efct_vi_detach_rxq not yet implemented */
 
+
+static int
+efct_design_parameters(struct ef_vi* vi, struct efab_nic_design_parameters* dp)
+{
+#define GET(PARAM) EFAB_NIC_DP_GET(*dp, PARAM)
+
+  /* Some values which are used on the critical path which we don't expect to
+   * change are hard-coded. We need to check these values, and will need to
+   * accommodate run-time values if the parameter ever does change.
+   */
+
+  /* If the superbuf size changes, we will need to use it as a runtime value,
+   * replacing EFCT_RX_SUPERBUF_BYTES and its dependent values */
+  if( GET(rx_superbuf_bytes) != EFCT_RX_SUPERBUF_BYTES ) {
+    LOG(ef_log("%s: unsupported rx_superbuf_bytes, %ld != %d", __FUNCTION__,
+               (long)GET(rx_superbuf_bytes), EFCT_RX_SUPERBUF_BYTES));
+    return -EOPNOTSUPP;
+  }
+
+  /* If the frame offset changes or is no longer fixed, we will need to
+   * update efct_vi_rxpkt_get (and duplicated code in efct_vi_rx_future_peek).
+   * It could use the parameter if it is still fixed, or read from the header.
+   */
+  if( GET(rx_frame_offset) != EFCT_RX_HEADER_NEXT_FRAME_LOC_1 - 2) {
+    LOG(ef_log("%s: unsupported rx_frame_offset, %ld != %d", __FUNCTION__,
+               (long)GET(rx_frame_offset), EFCT_RX_HEADER_NEXT_FRAME_LOC_1 - 2));
+    return -EOPNOTSUPP;
+  }
+
+  /* When writing to the aperture we use a bitmask to keep within range. This
+   * requires the size a power of two, and we shift by 3 because we write
+   * a uint64_t (8 bytes) at a time.
+   */
+  if( ! EF_VI_IS_POW2(GET(tx_aperture_bytes)) ) {
+    LOG(ef_log("%s: unsupported tx_aperture_bytes, %ld not a power of 2",
+               __FUNCTION__, (long)GET(tx_aperture_bytes)));
+    return -EOPNOTSUPP;
+  }
+  vi->vi_txq.efct_aperture_mask = (GET(tx_aperture_bytes) - 1) >> 3;
+
+  /* FIFO size, reduced by 8 bytes for the TX header. Hardware reduces this
+   * by one cache line to make their overflow tracking easier */
+  vi->vi_txq.ct_fifo_bytes = GET(tx_fifo_bytes) -
+                             EFCT_TX_ALIGNMENT - EFCT_TX_HEADER_BYTES;
+  vi->ts_subnano_bits = GET(timestamp_subnano_bits);
+  vi->unsol_credit_seq_mask = GET(unsol_credit_seq_mask);
+
+  return 0;
+}
+
 static int efct_post_filter_add(struct ef_vi* vi,
-                                const struct ef_filter_spec* fs,
-                                const struct ef_filter_cookie* cookie, int rxq)
+                                const ef_filter_spec* fs,
+                                const ef_filter_cookie* cookie, int rxq)
 {
 #ifdef __KERNEL__
   return 0; /* EFCT TODO */
 #else
   int rc;
   unsigned n_superbufs;
+
+   /* Block filters don't attach to an RXQ */
+  if( ef_vi_filter_is_block_only(cookie) )
+    return 0;
+
   EF_VI_ASSERT(rxq >= 0);
   n_superbufs = CI_ROUND_UP((vi->vi_rxq.mask + 1) * EFCT_PKT_STRIDE,
                             EFCT_RX_SUPERBUF_BYTES) / EFCT_RX_SUPERBUF_BYTES;
@@ -1397,7 +1537,12 @@ int efct_vi_prime(ef_vi* vi, ef_driver_handle dh)
     ci_resource_prime_qs_op_t  op;
     int i;
 
+    /* The loop below assumes that all rxqs will fit in the fixed array in
+     * the operations's arguments. If that assumption no longer holds, then
+     * this assertion will fail and we'll need a more complicated loop to split
+     * the queues across multiple operations. */
     EF_VI_BUILD_ASSERT(CI_ARRAY_SIZE(op.rxq_current) >= EF_VI_MAX_EFCT_RXQS);
+
     op.crp_id = efch_make_resource_id(vi->vi_resource_id);
     for( i = 0; i < vi->max_efct_rxq; ++i ) {
       ef_vi_efct_rxq* rxq = &vi->efct_rxq[i];
@@ -1417,6 +1562,30 @@ int efct_vi_prime(ef_vi* vi, ef_driver_handle dh)
 }
 #endif
 
+void efct_vi_start_transmit_warm(ef_vi* vi)
+{
+  ci_qword_t qword;
+  qword.u64[0] = vi->vi_txq.efct_fixed_header;
+
+  EF_VI_ASSERT(vi->nic_type.arch == EF_VI_ARCH_EFCT);
+  EF_VI_ASSERT(CI_QWORD_FIELD(qword, EFCT_TX_HEADER_WARM_FLAG) == 0);
+
+  CI_SET_QWORD_FIELD(qword, EFCT_TX_HEADER_WARM_FLAG, 1);
+  vi->vi_txq.efct_fixed_header = qword.u64[0];
+}
+
+void efct_vi_stop_transmit_warm(ef_vi* vi)
+{
+  ci_qword_t qword;
+  qword.u64[0] = vi->vi_txq.efct_fixed_header;
+
+  EF_VI_ASSERT(vi->nic_type.arch == EF_VI_ARCH_EFCT);
+  EF_VI_ASSERT(CI_QWORD_FIELD(qword, EFCT_TX_HEADER_WARM_FLAG) == 1);
+
+  CI_SET_QWORD_FIELD(qword, EFCT_TX_HEADER_WARM_FLAG, 0);
+  vi->vi_txq.efct_fixed_header = qword.u64[0];
+}
+
 static void efct_vi_initialise_ops(ef_vi* vi)
 {
   vi->ops.transmit               = efct_ef_vi_transmit;
@@ -1433,6 +1602,8 @@ static void efct_vi_initialise_ops(ef_vi* vi)
   vi->ops.transmit_alt_select_default = efct_ef_vi_transmit_alt_select_default;
   vi->ops.transmit_alt_stop      = efct_ef_vi_transmit_alt_stop;
   vi->ops.transmit_alt_go        = efct_ef_vi_transmit_alt_go;
+  vi->ops.receive_set_discards   = efct_ef_vi_receive_set_discards;
+  vi->ops.receive_get_discards   = efct_ef_vi_receive_get_discards;
   vi->ops.transmit_alt_discard   = efct_ef_vi_transmit_alt_discard;
   vi->ops.receive_init           = efct_ef_vi_receive_init;
   vi->ops.receive_push           = efct_ef_vi_receive_push;
@@ -1445,25 +1616,9 @@ static void efct_vi_initialise_ops(ef_vi* vi)
   vi->ops.transmit_memcpy_sync   = efct_ef_vi_transmit_memcpy_sync;
   vi->ops.transmit_ctpio_fallback = efct_ef_vi_transmit_ctpio_fallback;
   vi->ops.transmitv_ctpio_fallback = efct_ef_vi_transmitv_ctpio_fallback;
+  vi->internal_ops.design_parameters = efct_design_parameters;
   vi->internal_ops.post_filter_add = efct_post_filter_add;
-
-  /* The guarantees offered by RX_EXCLUSIVE imply that it's impossible for
-   * there to be more than one queue. These semantics aren't strictly
-   * necessary, but coming up with intelligible documentation of what the
-   * semantics would actually be were this not the case is hard. */
-  if( vi->vi_flags & EF_VI_RX_EXCLUSIVE )
-    vi->vi_flags |= EF_VI_EFCT_UNIQUEUE;
-
-  if( vi->vi_flags & EF_VI_EFCT_UNIQUEUE ) {
-    vi->max_efct_rxq = 1;
-    vi->ops.eventq_poll = efct_ef_eventq_poll_1rxtx;
-  }
-  else {
-    /* It wouldn't be difficult to specialise this by txable too, but this is
-     * the slow, backward-compatible variant so there's not much point */
-    vi->ops.eventq_poll = efct_ef_eventq_poll_generic;
-    vi->max_efct_rxq = EF_VI_MAX_EFCT_RXQS;
-  }
+  vi->ops.eventq_poll = efct_ef_eventq_poll;
 }
 
 void efct_vi_init(ef_vi* vi)
@@ -1475,5 +1630,16 @@ void efct_vi_init(ef_vi* vi)
   EF_VI_ASSERT( vi->nic_type.nic_flags & EFHW_VI_NIC_CTPIO_ONLY );
 
   efct_vi_initialise_ops(vi);
+  vi->max_efct_rxq = EF_VI_MAX_EFCT_RXQS;
   vi->evq_phase_bits = 1;
+  /* Set default rx_discard_mask for EFCT */
+  vi->rx_discard_mask = (
+     EF_VI_DISCARD_RX_L4_CSUM_ERR |
+     EF_VI_DISCARD_RX_L3_CSUM_ERR |
+     EF_VI_DISCARD_RX_ETH_FCS_ERR |
+     EF_VI_DISCARD_RX_ETH_LEN_ERR
+  );
+
+  vi->vi_txq.efct_fixed_header =
+      efct_tx_header(0, 0, (vi->vi_flags & EF_VI_TX_TIMESTAMPS) ? 1 : 0, 0, 0);
 }

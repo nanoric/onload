@@ -13,8 +13,7 @@
 #include "net_driver.h"
 
 /* set up basic operations required for all net devices */
-int efx_mcdi_filter_table_probe(struct efx_nic *efx, bool rss_limited,
-				bool additional_rss);
+int efx_mcdi_filter_table_probe(struct efx_nic *efx, bool additional_rss);
 /* enable operations we can do once we know the number of queues we have */
 int efx_mcdi_filter_table_init(struct efx_nic *efx, bool mc_chaining,
 			       bool encap);
@@ -53,6 +52,19 @@ bool efx_mcdi_filter_match_supported(struct efx_nic *efx,
 				     bool encap,
 				     unsigned int match_flags);
 
+struct efx_mcdi_dev_addr {
+	u8 addr[ETH_ALEN];
+};
+
+struct efx_mcdi_filter_addr_ops {
+	void (*get_addrs)(struct efx_nic *efx,
+			  bool *uc_promisc,
+			  bool *mc_promisc);
+};
+
+void
+efx_mcdi_filter_set_addr_ops(struct efx_nic *efx,
+			     const struct efx_mcdi_filter_addr_ops *addr_ops);
 void efx_mcdi_filter_sync_rx_mode(struct efx_nic *efx);
 s32 efx_mcdi_filter_insert(struct efx_nic *efx,
 			   const struct efx_filter_spec *spec,
@@ -76,9 +88,11 @@ void efx_mcdi_filter_unblock_kernel(struct efx_nic *efx,
 #endif
 
 u32 efx_mcdi_filter_count_rx_used(struct efx_nic *efx,
-			 	  enum efx_filter_priority priority);
+				  enum efx_filter_priority priority);
 int efx_mcdi_filter_clear_rx(struct efx_nic *efx,
 			     enum efx_filter_priority priority);
+int efx_mcdi_filter_remove_all(struct efx_nic *efx,
+			       enum efx_filter_priority priority);
 u32 efx_mcdi_filter_get_rx_id_limit(struct efx_nic *efx);
 s32 efx_mcdi_filter_get_rx_ids(struct efx_nic *efx,
 			       enum efx_filter_priority priority,
@@ -110,14 +124,11 @@ int efx_mcdi_rx_push_rss_context_config(struct efx_nic *efx,
 				 	struct efx_rss_context *ctx,
 					const u32 *rx_indir_table,
 					const u8 *key);
-int efx_mcdi_pf_rx_push_rss_config(struct efx_nic *efx, bool user,
-				   const u32 *rx_indir_table,
-				   const u8 *key);
-int efx_mcdi_vf_rx_push_rss_config(struct efx_nic *efx, bool user,
-				   const u32 *rx_indir_table
-				   __attribute__ ((unused)),
-				   const u8 *key
-				   __attribute__ ((unused)));
+int efx_mcdi_rx_push_rss_config(struct efx_nic *efx, bool user,
+				const u32 *rx_indir_table,
+				const u8 *key);
+int efx_mcdi_rx_push_shared_rss_config(struct efx_nic *efx,
+				       unsigned int *context_size);
 int efx_mcdi_push_default_indir_table(struct efx_nic *efx,
 				      unsigned int rss_spread);
 int efx_mcdi_rx_pull_rss_config(struct efx_nic *efx);
@@ -132,5 +143,14 @@ void efx_mcdi_rx_restore_rss_contexts(struct efx_nic *efx);
 
 bool efx_mcdi_filter_rfs_expire_one(struct efx_nic *efx, u32 flow_id,
 				    unsigned int filter_idx);
+#if defined(CONFIG_DEBUG_FS)
+int efx_debugfs_read_filter_list(struct seq_file *file, void *data);
+#endif
+
+/* only to be called from an addr_ops->get_addrs() */
+void efx_mcdi_filter_uc_addr(struct efx_nic *efx,
+			     const struct efx_mcdi_dev_addr *addr);
+void efx_mcdi_filter_mc_addr(struct efx_nic *efx,
+			     const struct efx_mcdi_dev_addr *addr);
 
 #endif
